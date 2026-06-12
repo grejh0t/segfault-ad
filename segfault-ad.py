@@ -5492,8 +5492,23 @@ class Nmap(Module):
             if '1433' in port_nums: suggestions.append('mssql')
             if '80'   in port_nums or '443' in port_nums or '8443' in port_nums:
                 suggestions.append('ffuf/certipy')
+            if '443'  in port_nums or '8443' in port_nums:
+                if '88' in port_nums: suggestions.append('certipy')
+            if '21'   in port_nums: suggestions.append('ftp')
             if suggestions:
                 log(f'Suggested: {WHITE}{" → ".join(suggestions)}{RESET}','info')
+                # auto-trigger offer
+                auto_mods = [s for s in suggestions if '/' not in s]
+                if auto_mods:
+                    log(f'{GREY}Auto-run suggestions? type module name or press enter to skip{RESET}','info')
+                    for s in auto_mods[:3]:
+                        ans = input_field(f'run {C0}{s}{RESET}?','n',choices=['y','n'])
+                        if ans == 'y':
+                            mod = MODULES.get(s)
+                            if mod:
+                                log(f'{PINK}→ auto-running {s}{RESET}','info')
+                                hr()
+                                mod().run(TARGET)
             add_result('nmap', f'{len(ports)} ports — {",".join(p for p,_ in ports[:6])}')
         else:
             log('No open ports found','warn')
@@ -5845,6 +5860,7 @@ class HashCrack(Module):
                         u, p = line.split(':',1)
                         _db_save_cred(ws, target.domain, u, p, source='hashcrack')
                 # also save user:pass format for autopwn pivot
+                _plain_passwords = []
                 for line in cracked:
                     # krb5asrep: $krb5asrep$23$user@domain:salt$hash:password
                     m = re.search(r'\$krb5asrep\$\d+\$([^@]+)@[^:]+:[^:]+:(.+)$', line)
@@ -5853,6 +5869,13 @@ class HashCrack(Module):
                         with open(os.path.join(loot,'cracked.txt'),'a') as _f:
                             _f.write(upass+'\n')
                         log(f'{GREEN}Saved: {WHITE}{upass}{RESET}','success')
+                        _plain_passwords.append(m.group(2))
+                    elif ':' in line and not line.startswith('$'):
+                        _plain_passwords.append(line.split(':',1)[1])
+
+                # ── password pattern generator ────────────────────────────
+                if _plain_passwords:
+                    _gen_password_patterns(_plain_passwords, loot)
         except Exception: pass
 
         # john fallback — especially useful for AES AS-REP hashes
@@ -9154,6 +9177,64 @@ def _gen_report(target):
     hr()
 
 
+def _gen_password_patterns(passwords, loot_dir):
+    """Generate password variants from cracked passwords and save to loot/patterns.txt."""
+    import string as _str
+    patterns = set()
+    current_year = __import__('datetime').datetime.now().year
+
+    for pw in passwords:
+        if not pw or len(pw) < 3: continue
+        base = pw.strip()
+        patterns.add(base)
+
+        # case variants
+        patterns.add(base.lower())
+        patterns.add(base.upper())
+        patterns.add(base.capitalize())
+
+        # strip trailing digits/specials to get root word
+        root = base.rstrip(_str.digits + _str.punctuation)
+        if root and root != base:
+            patterns.add(root)
+
+        # common suffixes
+        for suffix in ['!','!!','1','2','12','123','1234','#',
+                       str(current_year), str(current_year+1),
+                       str(current_year)[-2:], '01','@','$',
+                       '!1','!2','!123','!@#','*']:
+            patterns.add(base + suffix)
+            if root: patterns.add(root + suffix)
+
+        # common prefixes
+        for prefix in ['!','P@ssw0rd','Welcome','Admin']:
+            patterns.add(prefix + base)
+
+        # leet speak substitutions
+        leet = base.replace('a','@').replace('e','3').replace('i','1').replace('o','0').replace('s','$')
+        if leet != base:
+            patterns.add(leet)
+            patterns.add(leet + '!')
+            patterns.add(leet + '1')
+
+        # seasonal variants
+        for season in ['Spring','Summer','Autumn','Winter','Fall']:
+            for yr in [str(current_year), str(current_year+1), str(current_year)[-2:]]:
+                patterns.add(f'{season}{yr}')
+                patterns.add(f'{season}{yr}!')
+
+    # remove empty/short
+    patterns = sorted(p for p in patterns if len(p) >= 3)
+
+    out_path = os.path.join(loot_dir, 'patterns.txt')
+    with open(out_path, 'w') as f:
+        f.write('\n'.join(patterns) + '\n')
+
+    log(f'{GREEN}{len(patterns)} password patterns generated → {WHITE}{out_path}{RESET}', 'success')
+    log(f'{GREY}Use with: spray → wordlist > {out_path}{RESET}', 'info')
+    return out_path
+
+
 def show_loot(target):
     hr()
     if not os.path.isdir(target.loot_dir):
@@ -11982,6 +12063,31 @@ def repl():
         else: log(f'Unknown: {cmd} -- type help','warn')
 
 
+def _load_spawn_state():
+    """Auto-load target from spawn.py state file if present."""
+    spawn_state = os.path.expanduser('~/.segfault-ad/spawn_state')
+    if not os.path.exists(spawn_state): return False
+    try:
+        import configparser as _cp
+        cfg = _cp.ConfigParser()
+        cfg.read(spawn_state)
+        s = cfg['spawn'] if 'spawn' in cfg else {}
+        ip     = s.get('ip','').strip()
+        name   = s.get('name','').strip()
+        domain = s.get('domain','').strip()
+        fqdn   = s.get('fqdn','').strip()
+        if not ip: return False
+        TARGET.dc = ip
+        if domain: TARGET.domain = domain
+        if fqdn:   TARGET.dc_fqdn = fqdn
+        log(f'{GREEN}spawn.py state loaded:{RESET} {WHITE}{name}{RESET} @ {WHITE}{ip}{RESET}','success')
+        if domain: log(f'  domain: {WHITE}{domain}{RESET}','info')
+        if fqdn:   log(f'  fqdn:   {WHITE}{fqdn}{RESET}','info')
+        return True
+    except Exception:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(prog='segfault-ad',
         description='segfault-ad -- AD pentest toolkit // segfault.solutions')
@@ -11992,6 +12098,10 @@ def main():
     parser.add_argument('--dc',            help='DC IP address')
     parser.add_argument('--dc-fqdn',       help='DC FQDN (e.g. dc01.domain.local)')
     args = parser.parse_args()
+
+    # load spawn.py state first (lowest priority — CLI args override)
+    _load_spawn_state()
+
     if args.domain:   TARGET.domain   = args.domain
     if args.user:     TARGET.user     = args.user
     if args.password: TARGET.password = args.password
@@ -12000,7 +12110,6 @@ def main():
     if hasattr(args,'dc_fqdn') and args.dc_fqdn: TARGET.dc_fqdn = args.dc_fqdn
 
     _startup_banner()  # initial state so right pane renders immediately
-
 
     repl()
 
