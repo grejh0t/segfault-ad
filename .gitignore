@@ -6,3 +6,4 @@ ligolo-selfcerts/
 HTB-Vault/
 administrator.pfx
 ca_operator.pfx
+*.bak
