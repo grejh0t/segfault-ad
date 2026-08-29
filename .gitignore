@@ -1,0 +1,8 @@
+*.pfx
+*.ccache
+*.bak
+ligolo-ng.*
+ligolo-selfcerts/
+HTB-Vault/
+administrator.pfx
+ca_operator.pfx
