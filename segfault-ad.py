@@ -13378,7 +13378,7 @@ GIT_REPOS = [
     ('SystemDPAPIdump',  'https://github.com/fortra/impacket',                  None, 'SystemDPAPIdump.py'),
     ('abuseACL',         'https://github.com/AetherBlack/abuseACL',             'pip install . --break-system-packages 2>/dev/null; true', 'abuseACL'),
     ('pywsus',           'https://github.com/GoSecure/pywsus',                  'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'pywsus.py'),
-    ('ADCSKiller',       'https://github.com/cube0x0/ADCSKiller',               'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'ADCSKiller.py'),
+    ('ADCSKiller',       'https://github.com/grimlockx/ADCSKiller',             'pip install -r requirements.txt --break-system-packages 2>/dev/null; true', 'adcskiller.py'),
     ('Grouper2',         'https://github.com/l0ss/Grouper2',                    None, 'Grouper2.exe'),
     ('ACLight',          'https://github.com/cyberark/ACLight',                  None, 'ACLight2.ps1'),
 ]
