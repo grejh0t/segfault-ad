@@ -770,6 +770,13 @@ def check_tool(*names):
     for n in names:
         p = shutil.which(n)
         if p: return p
+    # Kali's python3-impacket .deb renames scripts to "impacket-<Name>". The
+    # upstream PyPI package (what non-Kali distros get via pip) ships them
+    # under their original "<Name>.py" filename instead — fall back to that.
+    for n in names:
+        if n.startswith('impacket-'):
+            p = shutil.which(n[len('impacket-'):] + '.py')
+            if p: return p
     # also search ./tools/ subdirs for scripts cloned by installer
     tools_dir = os.path.expanduser('~/.segfault-ad/tools')
     _local_tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools')
@@ -794,6 +801,28 @@ def check_tool(*names):
     return None
 
 
+def _is_arch():
+    """True on Arch/BlackArch/Omarchy — no apt, but pacman is present."""
+    return not check_tool('apt-get', 'apt') and bool(check_tool('pacman'))
+
+# apt package name -> pacman package name, wherever they differ
+_APT_TO_PACMAN = {
+    'ldap-utils':        'openldap',
+    'python3-pip':       'python-pip',
+    'golang-go':         'go',
+    'faketime':          'libfaketime',
+    'ntpdate':           'ntp',
+    'ftp':               'tnftp',
+    'samba-common-bin':  'samba',
+}
+
+def pkg_hint(pkg, flags=''):
+    """Copy-pasteable system package install hint for whichever distro this is."""
+    if _is_arch():
+        return f'sudo pacman -S --needed {_APT_TO_PACMAN.get(pkg, pkg)}'
+    tail = f' {flags}' if flags else ''
+    return f'sudo apt install {pkg}{tail}'
+
 TOOL_INSTALL = {
     'netexec':              'pip install netexec --break-system-packages',
     'nxc':                  'pip install netexec --break-system-packages',
@@ -813,15 +842,15 @@ TOOL_INSTALL = {
     'impacket-owneredit':   'pip install impacket --break-system-packages',
     'impacket-addcomputer': 'pip install impacket --break-system-packages',
     'evil-winrm':           'gem install evil-winrm',
-    'kerbrute':             'go install github.com/ropnop/kerbrute@latest  OR  apt install kerbrute',
+    'kerbrute':             f"go install github.com/ropnop/kerbrute@latest  OR  {pkg_hint('kerbrute')}",
     'rusthound-ce':         'cargo install rusthound-ce  OR  download from github',
     'bloodhound-python':    'pip install bloodhound --break-system-packages',
     'ldeep':                'pip install ldeep --break-system-packages',
-    'john':                 'sudo apt install john',
-    'hashcat':              'sudo apt install hashcat',
-    'faketime':             'sudo apt install faketime',
-    'ntpdate':              'sudo apt install ntpdate',
-    'smbclient':            'sudo apt install smbclient',
+    'john':                 pkg_hint('john'),
+    'hashcat':              pkg_hint('hashcat'),
+    'faketime':             pkg_hint('faketime'),
+    'ntpdate':              pkg_hint('ntpdate'),
+    'smbclient':            pkg_hint('smbclient'),
     'pywhisker':            'git clone https://github.com/ShutdownRepo/pywhisker ~/.segfault-ad/tools/pywhisker',
     'username-anarchy':     'git clone https://github.com/urbanadventurer/username-anarchy ~/.segfault-ad/tools/username-anarchy',
     'gettgtpkinit':         'git clone https://github.com/dirkjanm/PKINITtools ~/.segfault-ad/tools/PKINITtools',
@@ -832,8 +861,8 @@ TOOL_INSTALL = {
     'pypsrp':               'pip install pypsrp --break-system-packages',
     'timeroast':            'git clone https://github.com/SecuraBV/Timeroast  # or: nxc -M timeroast (built-in)',
     'ligolo-proxy':         'wget https://github.com/nicocha30/ligolo-ng/releases/latest  # download proxy + agent',
-    'ffuf':                 'sudo apt install ffuf -y  # or: go install github.com/ffuf/ffuf/v2@latest',
-    'nmap':                 'sudo apt install nmap -y',
+    'ffuf':                 f"{pkg_hint('ffuf', '-y')}  # or: go install github.com/ffuf/ffuf/v2@latest",
+    'nmap':                 pkg_hint('nmap', '-y'),
     'pywerview':            'pip install "pywerview[kerberos]" --break-system-packages',
     'AADInternals':         'git clone https://github.com/Gerenios/AADInternals ~/.segfault-ad/tools/AADInternals',
     'adconnectdump':        'git clone https://github.com/fox-it/adconnectdump ~/.segfault-ad/tools/adconnectdump',
@@ -1744,7 +1773,10 @@ class Enum(Module):
         smb_broken = 'regsecrets' in (test.stdout + test.stderr) or 'ModuleNotFoundError' in (test.stdout + test.stderr)
         if smb_broken:
             log(f'{RED}netexec SMB broken — impacket version conflict{RESET}', 'error')
-            log(f'Fix: {WHITE}sudo apt reinstall netexec -y && pip uninstall impacket -y && sudo apt install python3-impacket -y{RESET}', 'info')
+            if _is_arch():
+                log(f'Fix: {WHITE}pip install --upgrade --break-system-packages netexec impacket{RESET}', 'info')
+            else:
+                log(f'Fix: {WHITE}sudo apt reinstall netexec -y && pip uninstall impacket -y && sudo apt install python3-impacket -y{RESET}', 'info')
             log(f'Falling back to LDAP protocol for what it supports...', 'warn')
             base = [nxc, 'ldap'] + target.nxc_args()
             flags_map = {'users':['--users'],'groups':['--groups'],'rid-brute':['--rid-brute']}
@@ -2760,7 +2792,7 @@ class NXCExec(Module):
                 nxc = self.need('netexec','nxc','crackmapexec','cme')
                 if not nxc: return
                 log(f'{ORANGE}evil-winrm not found — falling back to netexec (no interactive shell){RESET}','warn')
-                log(f'Install: {WHITE}sudo apt install evil-winrm -y{RESET}','info')
+                log(f'Install: {WHITE}gem install evil-winrm{RESET}','info')
                 cmd_run = self.ask('command','whoami /all')
                 run_cmd([nxc,'winrm',t_host]+target.nxc_args(t_host)+['-x',cmd_run], label='netexec winrm')
         elif proto == 'smb':
@@ -2843,7 +2875,7 @@ class BloodyAttack(Module):
                              '-S',target.dc],
                             label='net rpc password reset')
                 else:
-                    log('net not found — try: sudo apt install samba-common-bin','error')
+                    log(f"net not found — try: {pkg_hint('samba-common-bin')}",'error')
         elif action == 'adduser':
             nu = self.ask('new username'); np = self.ask('password','Passw0rd123!')
             rc = run_cmd(base+['add','user',nu,np], label='bloodyAD adduser')
@@ -3953,7 +3985,7 @@ class Coerce(Module):
         if action == 'capture':
             resp = check_tool('responder','Responder.py')
             if not resp:
-                log('Responder not found — install: sudo apt install responder','error')
+                log(f"Responder not found — install: {pkg_hint('responder')}",'error')
                 hr(); return
 
             iface    = self.ask('interface','tun0')
@@ -7250,7 +7282,7 @@ class SMBClient(Module):
                 auth, hashes = target.imp_str(t_host)
                 subprocess.call([imp_smbclient]+auth+hashes+['-share',share])
         else:
-            log('smbclient not found — install: sudo apt install smbclient','error')
+            log(f"smbclient not found — install: {pkg_hint('smbclient')}",'error')
         hr()
 
 
@@ -7668,7 +7700,7 @@ class Unauth(Module):
                         if m: users_found.append(m.group(1).split('@')[0])
                     if users_found: _save_users(list(set(users_found)), target.loot_dir, target.domain)
                 else:
-                    log(f'Wordlist not found — try: {WHITE}sudo apt install seclists{RESET}','warn')
+                    log(f"Wordlist not found — try: {WHITE}{pkg_hint('seclists')}{RESET}",'warn')
             elif not kb:
                 log('kerbrute not found — run: install','warn')
 
@@ -9061,7 +9093,7 @@ class PassiveSniff(Module):
         log(f'{C0}passive sniff{RESET} on {WHITE}{iface}{RESET} for {WHITE}{duration}s{RESET}','info')
 
         if not _sh.which('tcpdump'):
-            log('tcpdump not found — sudo apt install tcpdump','error'); return
+            log(f"tcpdump not found — {pkg_hint('tcpdump')}",'error'); return
 
         bpf = ('udp port 5355 or '   # LLMNR
                'udp port 5353 or '   # mDNS
@@ -9997,7 +10029,7 @@ class KeePass(Module):
             hashcat = check_tool('hashcat')
 
             if not kp2j:
-                log('keepass2john not found — install: apt install john','error')
+                log(f"keepass2john not found — install: {pkg_hint('john')}",'error')
                 hr(); return
 
             hash_file = os.path.join(target.loot_dir,'kdbx.hash')
@@ -10153,7 +10185,7 @@ class FTP(Module):
             if ftp_bin:
                 os.execvp(ftp_bin, [ftp_bin, host])
             else:
-                log('ftp binary not found — install: apt install ftp','error')
+                log(f"ftp binary not found — install: {pkg_hint('ftp')}",'error')
         hr()
 
 
@@ -12841,7 +12873,7 @@ def detect_skew(target):
                 log(f'faketime available — Kerberos modules will auto-wrap', 'success')
                 log(f'All commands will run as: {WHITE}faketime "{skew_str}" <cmd>{RESET}', 'info')
             else:
-                log('faketime not found — install: {WHITE}sudo apt install faketime{RESET}', 'warn')
+                log(f"faketime not found — install: {WHITE}{pkg_hint('faketime')}{RESET}", 'warn')
                 log(f'Or sync manually: {WHITE}sudo ntpdate {target.dc}{RESET}  {GREY}(or ntpsec-ntpdate on Kali 2024+){RESET}', 'info')
                 log(f'Or force sync:    {WHITE}sudo timedatectl set-ntp false && sudo date -s "{dc_time}"{RESET}', 'info')
     hr()
@@ -13310,6 +13342,14 @@ APT_PKGS = [
     # ntpdate handled separately — Kali 2024+ ships ntpsec-ntpdate instead
 ]
 
+# apt package name -> pacman package name, wherever they differ (Arch/BlackArch)
+PACMAN_PKG_MAP = {
+    'ldap-utils':  'openldap',
+    'python3-pip': 'python-pip',
+    'golang-go':   'go',
+    'faketime':    'libfaketime',   # Arch ships the faketime binary in libfaketime
+}
+
 # git repos — (name, url, post_cmd, binary_to_check)
 # rusthound-ce installed via cargo — handled separately in run_install
 RUSTHOUND_CE = True  # flag to trigger cargo install in run_install
@@ -13373,7 +13413,15 @@ WIN_BINS = [
 
 def _pip_installed(binary):
     """Check if a pip tool is available by its binary name."""
-    return bool(check_tool(binary))
+    if check_tool(binary): return True
+    # some pip packages (e.g. ldap3) are pure libraries with no CLI binary —
+    # fall back to checking whether the module itself imports
+    try:
+        import importlib
+        importlib.import_module(binary)
+        return True
+    except ImportError:
+        return False
 
 def _apt_installed(binary):
     return bool(check_tool(binary))
@@ -13422,6 +13470,7 @@ def run_install():
 
     pip = check_tool('pip3', 'pip')
     apt = check_tool('apt-get', 'apt')
+    pacman = check_tool('pacman')
     git = check_tool('git')
 
     # Pre-flight: check what's already there
@@ -13504,8 +13553,19 @@ def run_install():
                     log(f'{RED}failed{RESET}: {pkg}', 'error')
                 else:
                     log(f'{GREEN}ok{RESET}: {pkg}', 'success')
+        elif pacman:
+            log(f'apt not found — using pacman for {len(apt_missing)} package(s)...', 'info')
+            for pkg in apt_missing:
+                pm_pkg = PACMAN_PKG_MAP.get(pkg, pkg)
+                log(f'pacman -S {WHITE}{pm_pkg}{RESET}...', 'info')
+                rc = run_cmd(['sudo', pacman, '-S', '--noconfirm', '--needed', pm_pkg])
+                if rc != 0:
+                    errors.append(f'pacman -S {pm_pkg} failed')
+                    log(f'{RED}failed{RESET}: {pm_pkg}', 'error')
+                else:
+                    log(f'{GREEN}ok{RESET}: {pm_pkg}', 'success')
         else:
-            log('apt not found — skipping', 'warn')
+            log('apt/pacman not found — skipping', 'warn')
     else:
         log('apt: all packages present — skipping', 'success')
 
@@ -13541,8 +13601,15 @@ def run_install():
 
     # ── ntpdate — deprecated on Kali 2024+, try ntpsec-ntpdate fallback ─────
     if not check_tool('ntpdate') and not check_tool('ntpsec-ntpdate'):
-        log('ntpdate not found — trying ntpsec-ntpdate...', 'info')
-        if apt:
+        if pacman:
+            log('ntpdate not found — installing via pacman (ntp package)...', 'info')
+            rc = run_cmd(['sudo', pacman, '-S', '--noconfirm', '--needed', 'ntp'])
+            if rc == 0:
+                log(f'{GREEN}ok{RESET}: ntp (provides ntpdate)', 'success')
+            else:
+                log('ntp install failed — clock sync will use rdate or manual set', 'warn')
+        elif apt:
+            log('ntpdate not found — trying ntpsec-ntpdate...', 'info')
             rc = run_cmd(['sudo', apt, 'install', '-y', 'ntpsec-ntpdate'])
             if rc == 0:
                 log(f'{GREEN}ok{RESET}: ntpsec-ntpdate (replaces ntpdate)', 'success')
