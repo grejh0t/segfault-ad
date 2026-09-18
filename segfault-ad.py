@@ -13401,7 +13401,7 @@ WIN_BINS = [
     ('SharpUp.exe',          'https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/SharpUp.exe',                                  'exe'),
     ('Seatbelt.exe',         'https://github.com/r3motecontrol/Ghostpack-CompiledBinaries/raw/master/Seatbelt.exe',                                 'exe'),
     ('Snaffler.exe',         'https://github.com/SnaffCon/Snaffler/releases/latest/download/Snaffler.exe',                                           'exe'),
-    ('SharpHound.exe',       'https://github.com/SpecterOps/SharpHound/releases/download/v2.6.0/SharpHound.exe',                                         'exe'),
+    ('SharpHound.exe',       'https://github.com/SpecterOps/SharpHound/releases/download/v2.16.0/SharpHound_v2.16.0_windows_x86.zip',                    'zip'),
     ('GodPotato-NET4.exe',   'https://github.com/BeichenDream/GodPotato/releases/download/V1.20/GodPotato-NET4.exe',                               'exe'),
     # PowerShell scripts
     ('PowerView.ps1',        'https://github.com/PowerShellMafia/PowerSploit/raw/master/Recon/PowerView.ps1',                                      'exe'),
